@@ -69,7 +69,7 @@ briefing_cache:     str                      = ""   # latest Slack briefing stor
 # ── Transcript accumulator ─────────────────────────────────────────────────────
 # Collects STT fragments and waits for a pause before sending to Claude.
 # Fixes sentence-splitting: "Can you give me" + "your updates Max" → one message.
-ACCUMULATOR_PAUSE   = 2.0   # seconds of silence before flushing to Claude
+ACCUMULATOR_PAUSE   = 3.0   # seconds of silence before flushing to Claude (2.0 was too short — users pause mid-sentence)
 transcript_fragments: list[str] = []
 _flush_task: Optional[asyncio.Task] = None
 
@@ -108,8 +108,9 @@ async def pcm_to_text(pcm_bytes: bytes) -> str:
                 f"https://api.deepgram.com/v1/listen"
                 f"?model={DEEPGRAM_STT_MODEL}&encoding=linear16"
                 f"&sample_rate={SAMPLE_RATE}&language=en&smart_format=true"
-                f"&keywords=Max:10&keywords=Jira:10&keywords=EverPerform:5&keywords=ESB:10"
-                f"&keywords=ticket:5&keywords=standup:5&keywords=testing:5&keywords=blocker:5",
+                f"&keywords=Max:15&keywords=Jira:10&keywords=EverPerform:5&keywords=ESB:10"
+                f"&keywords=ticket:5&keywords=standup:5&keywords=testing:5&keywords=blocker:5"
+                f"&keywords=Mike:5&keywords=Mack:5",
                 headers={
                     "Authorization": f"Token {key}",
                     "Content-Type": "audio/raw",
@@ -456,10 +457,18 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
 
 
 def _clean_transcript(text: str) -> str:
-    """Fix common STT artifacts, especially fragmented numbers.
+    """Fix common STT artifacts, especially fragmented numbers and name mishearings.
     '30. 99.' → '3099', 'ticket number 30. 99' → 'ticket number 3099'
-    Also: 'K.' standalone fragments, double spaces, etc.
+    'Hey, Mike' → 'Hey, Max' (STT consistently hears Max as Mike/Mack/Next/Mark)
     """
+    # Fix Max name mishearings — STT consistently gets these wrong
+    # Must be done BEFORE other cleanup to preserve sentence structure
+    text = re.sub(r"\bMike\b", "Max", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bMack\b", "Max", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bMarks?\b", "Max", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bMacs?\b", "Max", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bAmex\b", "Max", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bNext\b", "Max", text, flags=re.IGNORECASE)
     # Remove standalone single-letter fragments like "K." "A." "Space."
     text = re.sub(r"\b[A-Z]\.\s*", "", text)
     # Remove "Space." artifacts
