@@ -477,6 +477,7 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
             try:
                 audio_pcm = send_queue.get_nowait()
                 await websocket.send_bytes(audio_pcm)
+                alog(f"SENT {len(audio_pcm):,}B to MBaaS")
             except asyncio.QueueEmpty:
                 # No speech queued — send silence to keep the stream alive
                 await websocket.send_bytes(SILENCE_FRAME)
