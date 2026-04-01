@@ -29,6 +29,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from typing import Optional
 
@@ -164,32 +165,74 @@ def _jira_auth() -> Optional[str]:
     return base64.b64encode(f"{email}:{token}".encode()).decode()
 
 
+def _normalize_ticket_id(raw: str) -> str:
+    """Normalize a ticket ID from STT-mangled input.
+    Examples: '399' → 'ESB-399', 'ESB-1399' → 'ESB-1399', '1399' → 'ESB-1399'
+    """
+    raw = raw.strip().upper()
+    # Already has project prefix
+    if re.match(r"[A-Z]+-\d+", raw):
+        return raw
+    # Just a number — add ESB- prefix
+    digits = re.sub(r"[^0-9]", "", raw)
+    if digits:
+        project = os.getenv("JIRA_PROJECT_KEY", "ESB")
+        return f"{project}-{digits}"
+    return raw
+
+
 async def jira_get_ticket(ticket_id: str) -> dict:
     auth = _jira_auth()
     if not auth:
         return {"error": "Jira not configured (JIRA_API_TOKEN missing)"}
     base = os.getenv("JIRA_URL", "https://everperform.atlassian.net")
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{base}/rest/api/3/issue/{ticket_id}"
-                f"?fields=summary,status,assignee,priority,description",
-                headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
-                timeout=10,
-            )
-        if resp.status_code == 200:
-            d = resp.json()
-            f = d.get("fields", {})
-            return {
-                "id":       d.get("key"),
-                "summary":  f.get("summary"),
-                "status":   f.get("status", {}).get("name"),
-                "assignee": (f.get("assignee") or {}).get("displayName", "unassigned"),
-                "priority": (f.get("priority") or {}).get("name"),
-            }
-        return {"error": f"Jira {resp.status_code}"}
-    except Exception as e:
-        return {"error": str(e)}
+    project = os.getenv("JIRA_PROJECT_KEY", "ESB")
+
+    # Normalize the ticket ID (STT often mangles numbers)
+    ticket_id = _normalize_ticket_id(ticket_id)
+    alog(f"JIRA lookup: {ticket_id}")
+
+    async def _try_fetch(tid: str) -> Optional[dict]:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{base}/rest/api/3/issue/{tid}"
+                    f"?fields=summary,status,assignee,priority,description",
+                    headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
+                    timeout=10,
+                )
+            if resp.status_code == 200:
+                d = resp.json()
+                f = d.get("fields", {})
+                return {
+                    "id":       d.get("key"),
+                    "summary":  f.get("summary"),
+                    "status":   f.get("status", {}).get("name"),
+                    "assignee": (f.get("assignee") or {}).get("displayName", "unassigned"),
+                    "priority": (f.get("priority") or {}).get("name"),
+                }
+        except Exception as e:
+            logger.error(f"Jira fetch error for {tid}: {e}")
+        return None
+
+    # Try the normalized ID first
+    result = await _try_fetch(ticket_id)
+    if result:
+        return result
+
+    # Fallback: if the number is short (e.g., "399"), try common prefixes
+    # STT often drops leading digits: "1399" → "30. 99" → "3099" or "399"
+    digits = re.sub(r"[^0-9]", "", ticket_id)
+    if digits and len(digits) <= 3:
+        # Try with "1" prefix (most common: 1399 heard as 399)
+        for prefix in ["1", "2"]:
+            fallback_id = f"{project}-{prefix}{digits}"
+            alog(f"JIRA fallback: {fallback_id}")
+            result = await _try_fetch(fallback_id)
+            if result:
+                return result
+
+    return {"error": f"Ticket {ticket_id} not found. Ask them to repeat the ticket number."}
 
 
 async def jira_testing_tickets() -> list[dict]:
@@ -412,6 +455,22 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
     _flush_task = asyncio.create_task(_flush_accumulated(bot_id))
 
 
+def _clean_transcript(text: str) -> str:
+    """Fix common STT artifacts, especially fragmented numbers.
+    '30. 99.' → '3099', 'ticket number 30. 99' → 'ticket number 3099'
+    Also: 'K.' standalone fragments, double spaces, etc.
+    """
+    # Remove standalone single-letter fragments like "K." "A." "Space."
+    text = re.sub(r"\b[A-Z]\.\s*", "", text)
+    # Remove "Space." artifacts
+    text = re.sub(r"\bSpace\.\s*", "", text, flags=re.IGNORECASE)
+    # Join fragmented numbers: "30. 99" → "3099", "13. 99" → "1399"
+    text = re.sub(r"(\d+)\.\s+(\d+)", r"\1\2", text)
+    # Clean up multiple spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 async def _flush_accumulated(bot_id: str) -> None:
     """Wait for a pause, then send all accumulated fragments to Claude as one message."""
     global speaking_until
@@ -420,8 +479,8 @@ async def _flush_accumulated(bot_id: str) -> None:
     if not transcript_fragments:
         return
 
-    # Join all fragments into one complete message
-    full_transcript = " ".join(transcript_fragments)
+    # Join all fragments into one complete message and clean up STT artifacts
+    full_transcript = _clean_transcript(" ".join(transcript_fragments))
     transcript_fragments.clear()
 
     alog(f"FLUSH to Claude: {full_transcript[:80]!r}")
@@ -464,27 +523,30 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
     alog(f"WS/BIDIR connected bot_id={bot_id}")
     logger.info(f"🎙️  Bidirectional stream connected — bot: {bot_id}")
 
-    # Greet the team once connected — give Meeting BaaS 8s to fully establish audio stream
+    # Greet the team once audio is confirmed working.
+    # Instead of a standalone TTS call (which may fire before MBaaS is ready),
+    # we use the normal response pipeline — same path that handles regular messages.
     async def _greet():
         global speaking_until
         try:
-            await asyncio.sleep(8.0)
-            alog("GREET calling TTS...")
-            pcm = await text_to_pcm("Hey team! Max here, ready for standup!")
-            if pcm:
+            # Wait 10s for MBaaS to fully establish the audio stream
+            await asyncio.sleep(10.0)
+            alog("GREET generating via normal pipeline...")
+            greeting_text = "Hey team! Max here, ready to crush some testing today!"
+            audio_pcm = await text_to_pcm(greeting_text)
+            if audio_pcm:
                 frame_size = int(SAMPLE_RATE * 0.1 * 2)
-                n = -(-len(pcm) // frame_size)
-                for i in range(0, len(pcm), frame_size):
-                    await send_queue.put(pcm[i:i + frame_size])
-                # Set echo guard AFTER queuing — guard starts when frames begin sending
-                speaking_until = time.time() + (n * 0.1) + 2.0  # extra buffer for greeting
-                alog(f"GREET queued {len(pcm):,}B in {n} frames (echo guard {n*0.1+2.0:.1f}s)")
-                logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
+                n = -(-len(audio_pcm) // frame_size)
+                speaking_until = time.time() + (n * 0.1) + 2.0
+                for i in range(0, len(audio_pcm), frame_size):
+                    await send_queue.put(audio_pcm[i:i + frame_size])
+                alog(f"GREET queued {len(audio_pcm):,}B in {n} frames")
+                # Also add to conversation so Claude knows Max already greeted
+                conversation.append({"role": "assistant", "content": greeting_text})
             else:
-                alog("GREET FAILED — TTS returned empty audio")
-                logger.error("Greeting TTS returned empty audio")
+                alog("GREET FAILED — TTS returned empty")
         except Exception as e:
-            alog(f"GREET EXCEPTION: {e}")
+            alog(f"GREET EXC: {e}")
             logger.error(f"Greeting error: {e}")
 
     asyncio.create_task(_greet())
