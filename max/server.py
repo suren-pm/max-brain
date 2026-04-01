@@ -52,8 +52,8 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested str
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
-BUFFER_SECS          = 3.0                           # STT batch window — 3s gives STT more context
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 144000 bytes at 24kHz
+BUFFER_SECS          = 1.5                           # STT batch window — balance speed vs context
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 72000 bytes at 24kHz
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
 
 TRIGGER_RE = re.compile(
@@ -389,39 +389,20 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
 
     logger.info(f"🎤 [{bot_id}] {transcript[:100]}")
 
-    # Always listen — Max is a team member in the meeting.
-    # TRIGGER_RE determines if Max should RESPOND (speak up).
-    # Non-triggered transcripts are still sent to Claude as context
-    # so Max knows what's being discussed.
-    explicit_trigger = bool(TRIGGER_RE.search(transcript))
-
     # Track recent transcripts for debugging
     recent_transcripts.append({
         "text":      transcript[:200],
-        "triggered": explicit_trigger,
         "at":        time.strftime("%H:%M:%S"),
     })
     if len(recent_transcripts) > 20:
         recent_transcripts.pop(0)
 
-    if explicit_trigger:
-        # Someone addressed Max or asked him something — respond
-        logger.info(f"💬 Max triggered: {transcript[:80]}")
-        alog(f"TRIGGER: {transcript[:50]!r}")
-        response = await claude_respond("Team", transcript)
-    else:
-        # Not addressed directly — feed to Claude as context (no response)
-        # This way Max hears everything and can reference it when asked
-        conversation.append({
-            "role": "user",
-            "content": f'[Meeting audio — not addressed to Max]: "{transcript}"',
-        })
-        # Keep conversation manageable
-        if len(conversation) > 40:
-            conversation[:] = conversation[-30:]
-        alog(f"CONTEXT: {transcript[:50]!r}")
-        return  # no spoken response
-    if not response:
+    # Send EVERYTHING to Claude — let Claude decide if Max should respond.
+    # Claude's persona tells him to only speak when addressed or relevant.
+    alog(f"STT: {transcript[:50]!r}")
+    response = await claude_respond("Team", transcript)
+    if not response or response.strip() in ("...", "…", ""):
+        alog(f"SILENT (Claude chose not to respond)")
         return
 
     logger.info(f"🤖 Max: {response[:100]}")
