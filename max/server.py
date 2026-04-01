@@ -452,7 +452,8 @@ async def join_meeting(request: Request):
 
     if resp.status_code in (200, 201):
         result = resp.json()
-        bot_id = result.get("bot_id") or result.get("id", "unknown")
+        data   = result.get("data") or result
+        bot_id = data.get("bot_id") or data.get("id") or result.get("bot_id") or "unknown"
         logger.info(f"✅ Max joining {meeting_url} — bot_id: {bot_id}")
         return {"ok": True, "bot_id": bot_id, "meeting_url": meeting_url}
 
