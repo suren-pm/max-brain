@@ -52,8 +52,8 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested str
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
-BUFFER_SECS          = 1.5                           # STT batch window — reduced from 2.5s for faster response
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 72000 bytes at 24kHz
+BUFFER_SECS          = 2.0                           # STT batch window — 2s balances speed vs transcript quality
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 96000 bytes at 24kHz
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
 
 # ── In-memory state (persists while Railway process runs) ───────────────────────
@@ -61,6 +61,7 @@ audio_input_queues: dict[str, asyncio.Queue] = {}
 audio_buffers:      dict[str, bytes]         = {}
 conversation:       list[dict]               = []
 speaking_until:     float                    = 0.0  # timestamp when Max finishes speaking — suppress echo
+greeting_sent:      bool                     = False  # prevent double greeting
 pending_tasks:      list[dict]               = []
 test_results:       list[dict]               = []
 recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
@@ -533,14 +534,17 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
     logger.info(f"🎙️  Bidirectional stream connected — bot: {bot_id}")
 
     # Greet the team once audio is confirmed working.
-    # Instead of a standalone TTS call (which may fire before MBaaS is ready),
-    # we use the normal response pipeline — same path that handles regular messages.
     async def _greet():
-        global speaking_until
+        global speaking_until, greeting_sent
         try:
+            # Only greet once — prevents double greeting if multiple bots join
+            if greeting_sent:
+                alog("GREET skipped — already greeted")
+                return
+            greeting_sent = True
             # Wait 10s for MBaaS to fully establish the audio stream
             await asyncio.sleep(10.0)
-            alog("GREET generating via normal pipeline...")
+            alog("GREET generating...")
             greeting_text = "Hey team! Max here, ready to crush some testing today!"
             audio_pcm = await text_to_pcm(greeting_text)
             if audio_pcm:
