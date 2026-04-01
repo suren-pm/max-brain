@@ -73,6 +73,15 @@ test_results:       list[dict]               = []
 recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
 briefing_cache:     str                      = ""   # latest Slack briefing stored by Cowork
 
+# ── Audio pipeline counters (for /debug diagnosis) ──────────────────────────────
+audio_log: list[str] = []   # last 30 key events with timestamps
+
+def alog(msg: str) -> None:
+    """Append a timestamped event to audio_log (capped at 30 entries)."""
+    audio_log.append(f"{time.strftime('%H:%M:%S')} {msg}")
+    if len(audio_log) > 30:
+        audio_log.pop(0)
+
 # ── Anthropic client ────────────────────────────────────────────────────────────
 _anthropic: Optional[anthropic_sdk.AsyncAnthropic] = None
 
@@ -135,7 +144,9 @@ async def text_to_pcm(text: str) -> bytes:
                 timeout=20,
             )
         if resp.status_code == 200:
+            alog(f"TTS OK {len(resp.content):,} bytes (text={text[:30]!r})")
             return resp.content  # raw PCM bytes
+        alog(f"TTS FAIL {resp.status_code}: {resp.text[:60]}")
         logger.warning(f"TTS {resp.status_code}: {resp.text[:80]}")
     except Exception as e:
         logger.error(f"TTS error: {e}")
@@ -379,12 +390,14 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
     if audio_pcm:
         queue = audio_input_queues.get(bot_id)
         if queue:
-            # Split into 100ms frames so Meeting BaaS receives a natural real-time stream
-            # rather than one giant WebSocket message it can't play
-            frame_size = int(SAMPLE_RATE * 0.1 * 2)   # 3200 bytes = 100ms at 16kHz
+            frame_size = int(SAMPLE_RATE * 0.1 * 2)
+            n_frames = -(-len(audio_pcm) // frame_size)
             for i in range(0, len(audio_pcm), frame_size):
                 await queue.put(audio_pcm[i:i + frame_size])
-            logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {-(-len(audio_pcm)//frame_size)} frames")
+            alog(f"QUEUED {len(audio_pcm):,}B in {n_frames} frames for {bot_id}")
+            logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {n_frames} frames")
+        else:
+            alog(f"QUEUE MISS — no ws/input connected for bot_id={bot_id} (keys={list(audio_input_queues.keys())})")
 
 
 # ── WebSocket: Meeting BaaS audio output (meeting → Railway) ────────────────────
@@ -436,16 +449,20 @@ async def ws_input(websocket: WebSocket, bot_id: str):
     await websocket.accept()
     queue: asyncio.Queue = asyncio.Queue()
     audio_input_queues[bot_id] = queue
+    alog(f"WS/INPUT connected bot_id={bot_id}")
     logger.info(f"🔊 Input stream connected — bot: {bot_id}")
 
     # Greet the team once connected — give Meeting BaaS 1s to settle first
     async def _greet():
         await asyncio.sleep(1.0)
+        alog("GREET calling TTS...")
         pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
         if pcm:
             frame_size = int(SAMPLE_RATE * 0.1 * 2)
+            n = -(-len(pcm) // frame_size)
             for i in range(0, len(pcm), frame_size):
                 await queue.put(pcm[i:i + frame_size])
+            alog(f"GREET queued {len(pcm):,}B in {n} frames")
             logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
 
     asyncio.create_task(_greet())
@@ -460,7 +477,7 @@ async def ws_input(websocket: WebSocket, bot_id: str):
             try:
                 audio_pcm = queue.get_nowait()
                 await websocket.send_bytes(audio_pcm)
-                logger.info(f"🔊 Sent {len(audio_pcm):,} bytes to meeting")
+                alog(f"SENT {len(audio_pcm):,}B to MBaaS")
             except asyncio.QueueEmpty:
                 # No speech queued — send silence to keep the stream alive
                 await websocket.send_bytes(SILENCE_FRAME)
@@ -635,11 +652,13 @@ async def meeting_baas_webhook(request: Request):
 async def debug():
     """Shows recent STT transcripts — use to verify audio pipeline is working."""
     return {
-        "active_streams":    len(audio_input_queues),
-        "active_buffers":    {k: len(v) for k, v in audio_buffers.items()},
+        "active_streams":     len(audio_input_queues),
+        "active_buffers":     {k: len(v) for k, v in audio_buffers.items()},
         "recent_transcripts": recent_transcripts[-10:],
         "conversation_turns": len(conversation),
-        "as_of":             time.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "audio_log":          audio_log[-30:],
+        "sample_rate":        SAMPLE_RATE,
+        "as_of":              time.strftime("%Y-%m-%d %H:%M:%S IST"),
     }
 
 
