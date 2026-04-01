@@ -114,7 +114,8 @@ async def pcm_to_text(pcm_bytes: bytes) -> str:
                 f"https://api.deepgram.com/v1/listen"
                 f"?model={DEEPGRAM_STT_MODEL}&encoding=linear16"
                 f"&sample_rate={SAMPLE_RATE}&language=en&smart_format=true"
-                f"&keywords=Max:10&keywords=Jira:5&keywords=EverPerform:5&keywords=ESB:5",
+                f"&keywords=Max:10&keywords=Jira:10&keywords=EverPerform:5&keywords=ESB:10"
+                f"&keywords=ticket:5&keywords=standup:5&keywords=testing:5&keywords=blocker:5",
                 headers={
                     "Authorization": f"Token {key}",
                     "Content-Type": "audio/raw",
@@ -433,7 +434,7 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
 
     # Greet the team once connected — give Meeting BaaS 1s to settle first
     async def _greet():
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(5.0)
         alog("GREET calling TTS...")
         pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
         if pcm:
@@ -469,16 +470,17 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
                 asyncio.create_task(process_audio_chunk(bot_id, chunk))
 
     async def send_loop():
-        """Send TTS audio (or silence keepalive) to Meeting BaaS at real-time pace."""
+        """Send TTS audio (or silence keepalive) to Meeting BaaS at real-time pace.
+        Sends one frame per 100ms tick. When speech is queued, sends speech;
+        otherwise sends silence to keep the stream alive."""
         while True:
             try:
-                audio_pcm = send_queue.get_nowait()
+                # Wait up to 100ms for a speech frame
+                audio_pcm = await asyncio.wait_for(send_queue.get(), timeout=0.1)
                 await websocket.send_bytes(audio_pcm)
-                alog(f"SENT {len(audio_pcm):,}B to MBaaS")
-            except asyncio.QueueEmpty:
-                # No speech queued — send silence to keep the stream alive
+            except asyncio.TimeoutError:
+                # No speech queued — send silence keepalive
                 await websocket.send_bytes(SILENCE_FRAME)
-            await asyncio.sleep(0.1)  # real-time pacing: 100ms per frame
 
     recv_task = asyncio.create_task(receive_loop())
     send_task = asyncio.create_task(send_loop())
