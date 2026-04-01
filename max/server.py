@@ -3,19 +3,23 @@ Max's Railway Brain Server
 ==========================
 Stack: Meeting BaaS (audio I/O) → Deepgram STT → Claude (with tools) → Deepgram TTS
 
-Audio flow:
-  Google Meet audio  →  Meeting BaaS  →  wss://.../ws/output  →  Deepgram STT  →  Claude
-  Claude response    →  Deepgram TTS  →  wss://.../ws/input   →  Meeting BaaS  →  Google Meet
+Audio flow (BIDIRECTIONAL — single WebSocket endpoint):
+  Google Meet audio → Meeting BaaS → wss://.../ws/max → Deepgram STT → Claude
+  Claude response   → Deepgram TTS → wss://.../ws/max → Meeting BaaS → Google Meet
+
+Meeting BaaS API: POST https://api.meetingbaas.com/bots
+Streaming config:  { "streaming": { "input": url, "output": url, "audio_frequency": "16khz" } }
+Both input AND output point to the SAME bidirectional WebSocket /ws/{bot_id}.
 
 Endpoints:
-  POST /join                → trigger Max to join a meeting
-  WS   /ws/output/{bot_id} → receive meeting audio (PCM 16kHz)
-  WS   /ws/input/{bot_id}  → serve Max's voice audio (PCM 16kHz)
-  POST /tasks/log           → log task assigned in standup
-  GET  /tasks/log           → Cowork reads this at 10AM
-  POST /tasks/result        → Cowork posts test results
-  GET  /tasks/results       → Max reads before standup (all results + pending)
+  POST /join           → trigger Max to join a meeting
+  WS   /ws/{bot_id}   → bidirectional audio with Meeting BaaS (receive + send)
+  POST /tasks/log      → log task assigned in standup
+  GET  /tasks/log      → Cowork reads this at 10AM
+  POST /tasks/result   → Cowork posts test results
+  GET  /tasks/results  → Max reads before standup
   GET  /health
+  GET  /debug
 """
 from __future__ import annotations
 
@@ -42,11 +46,11 @@ app.add_middleware(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"
+MEETING_BAAS_API     = "https://api.meetingbaas.com"   # old API (not /v2) — supports streaming: {input, output}
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
-SAMPLE_RATE          = 24000                         # 24 kHz PCM (Meeting BaaS default; 16kHz not supported for playback)
-BUFFER_SECS          = 1.0                           # STT batch window (shorter = faster response)
+SAMPLE_RATE          = 16000                         # 16 kHz — confirmed working in speaking-meeting-bot
+BUFFER_SECS          = 1.0                           # STT batch window
 CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit)
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive
 
@@ -364,7 +368,7 @@ async def claude_respond(speaker: str, transcript: str) -> str:
 async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
     """STT → trigger check → Claude → TTS → queue audio for Meeting BaaS."""
     try:
-     return await _process_audio_chunk_inner(bot_id, pcm)
+        return await _process_audio_chunk_inner(bot_id, pcm)
     except Exception as e:
         alog(f"CHUNK EXC: {e}")
         logger.error(f"process_audio_chunk error: {e}")
@@ -406,60 +410,24 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
             alog(f"QUEUED {len(audio_pcm):,}B in {n_frames} frames for {bot_id}")
             logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {n_frames} frames")
         else:
-            alog(f"QUEUE MISS — no ws/input connected for bot_id={bot_id} (keys={list(audio_input_queues.keys())})")
+            alog(f"QUEUE MISS — no ws connected for bot_id={bot_id} (keys={list(audio_input_queues.keys())})")
 
 
-# ── WebSocket: Meeting BaaS audio output (meeting → Railway) ────────────────────
+# ── WebSocket: bidirectional audio with Meeting BaaS ───────────────────────────
 
-@app.websocket("/ws/output/{bot_id}")
-async def ws_output(websocket: WebSocket, bot_id: str):
-    """Meeting BaaS sends raw 16kHz PCM audio here (what participants say).
-    Handles both binary frames (raw PCM) and text frames (JSON with base64 audio)."""
+@app.websocket("/ws/{bot_id}")
+async def ws_bidirectional(websocket: WebSocket, bot_id: str):
+    """Single bidirectional WebSocket endpoint — Meeting BaaS connects here.
+    - Meeting BaaS SENDS meeting audio TO us  → we forward to STT → Claude
+    - We SEND TTS audio TO Meeting BaaS       → plays in Google Meet
+    Both directions on the same WebSocket connection (receive_loop + send_loop run concurrently).
+    """
     await websocket.accept()
+    send_queue: asyncio.Queue = asyncio.Queue()
+    audio_input_queues[bot_id] = send_queue
     audio_buffers[bot_id] = b""
-    logger.info(f"🎙️  Output stream connected — bot: {bot_id}")
-
-    try:
-        while True:
-            msg = await websocket.receive()
-
-            # Binary frame → raw PCM
-            if "bytes" in msg and msg["bytes"]:
-                audio_buffers[bot_id] += msg["bytes"]
-
-            # Text frame → JSON envelope with base64 audio (Meeting BaaS v2 format)
-            elif "text" in msg and msg["text"]:
-                try:
-                    payload = json.loads(msg["text"])
-                    raw = payload.get("data") or payload.get("audio") or ""
-                    if raw:
-                        audio_buffers[bot_id] += base64.b64decode(raw)
-                except Exception as e:
-                    logger.warning(f"WS text parse error: {e}")
-
-            if len(audio_buffers[bot_id]) >= CHUNK_SIZE:
-                chunk = audio_buffers[bot_id]
-                audio_buffers[bot_id] = b""
-                asyncio.create_task(process_audio_chunk(bot_id, chunk))
-
-    except WebSocketDisconnect:
-        logger.info(f"🔌 Output stream disconnected — bot: {bot_id}")
-        audio_buffers.pop(bot_id, None)
-    except Exception as e:
-        logger.error(f"❌ ws_output error: {e}")
-        audio_buffers.pop(bot_id, None)
-
-
-# ── WebSocket: Meeting BaaS audio input (Railway → meeting) ────────────────────
-
-@app.websocket("/ws/input/{bot_id}")
-async def ws_input(websocket: WebSocket, bot_id: str):
-    """Meeting BaaS pulls raw PCM audio from here to play in the meeting (Max speaking)."""
-    await websocket.accept()
-    queue: asyncio.Queue = asyncio.Queue()
-    audio_input_queues[bot_id] = queue
-    alog(f"WS/INPUT connected bot_id={bot_id}")
-    logger.info(f"🔊 Input stream connected — bot: {bot_id}")
+    alog(f"WS/BIDIR connected bot_id={bot_id}")
+    logger.info(f"🎙️  Bidirectional stream connected — bot: {bot_id}")
 
     # Greet the team once connected — give Meeting BaaS 1s to settle first
     async def _greet():
@@ -470,33 +438,62 @@ async def ws_input(websocket: WebSocket, bot_id: str):
             frame_size = int(SAMPLE_RATE * 0.1 * 2)
             n = -(-len(pcm) // frame_size)
             for i in range(0, len(pcm), frame_size):
-                await queue.put(pcm[i:i + frame_size])
+                await send_queue.put(pcm[i:i + frame_size])
             alog(f"GREET queued {len(pcm):,}B in {n} frames")
             logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
 
     asyncio.create_task(_greet())
 
-    try:
+    async def receive_loop():
+        """Receive meeting audio from Meeting BaaS and buffer for STT."""
         while True:
-            # Always pace at real-time: one 100ms frame per 100ms tick.
-            # IMPORTANT: get_nowait() so we never block here — the sleep below
-            # is what enforces the 100ms cadence regardless of queue depth.
-            # Without this sleep, queued TTS audio (e.g. 20 frames) would all
-            # be sent in one burst, and Meeting BaaS cannot play a burst dump.
+            msg = await websocket.receive()
+            # Binary frame → raw PCM
+            if "bytes" in msg and msg["bytes"]:
+                audio_buffers[bot_id] += msg["bytes"]
+            # Text frame → JSON envelope with base64 audio
+            elif "text" in msg and msg["text"]:
+                try:
+                    data = json.loads(msg["text"])
+                    raw = data.get("data") or data.get("audio") or ""
+                    if raw:
+                        audio_buffers[bot_id] += base64.b64decode(raw)
+                except Exception as e:
+                    logger.warning(f"WS text parse error: {e}")
+            # Flush buffer to STT when we have 1 second of audio
+            if len(audio_buffers[bot_id]) >= CHUNK_SIZE:
+                chunk = audio_buffers[bot_id]
+                audio_buffers[bot_id] = b""
+                asyncio.create_task(process_audio_chunk(bot_id, chunk))
+
+    async def send_loop():
+        """Send TTS audio (or silence keepalive) to Meeting BaaS at real-time pace."""
+        while True:
             try:
-                audio_pcm = queue.get_nowait()
+                audio_pcm = send_queue.get_nowait()
                 await websocket.send_bytes(audio_pcm)
                 alog(f"SENT {len(audio_pcm):,}B to MBaaS")
             except asyncio.QueueEmpty:
                 # No speech queued — send silence to keep the stream alive
                 await websocket.send_bytes(SILENCE_FRAME)
             await asyncio.sleep(0.1)  # real-time pacing: 100ms per frame
-    except WebSocketDisconnect:
-        logger.info(f"🔌 Input stream disconnected — bot: {bot_id}")
-        audio_input_queues.pop(bot_id, None)
+
+    recv_task = asyncio.create_task(receive_loop())
+    send_task = asyncio.create_task(send_loop())
+    try:
+        # Run both loops concurrently — clean up as soon as either ends (disconnect)
+        await asyncio.wait(
+            [recv_task, send_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
     except Exception as e:
-        logger.error(f"❌ ws_input error: {e}")
+        logger.error(f"ws_bidirectional error: {e}")
+    finally:
+        recv_task.cancel()
+        send_task.cancel()
         audio_input_queues.pop(bot_id, None)
+        audio_buffers.pop(bot_id, None)
+        logger.info(f"🔌 Bidirectional stream disconnected — bot: {bot_id}")
 
 
 # ── Join endpoint ───────────────────────────────────────────────────────────────
@@ -516,21 +513,21 @@ async def join_meeting(request: Request):
     if not domain:
         return {"error": "RAILWAY_PUBLIC_DOMAIN env var not set on Railway"}
 
-    # streaming_config.input_url  = Meeting BaaS reads bot TTS audio FROM here → plays in meeting
-    # streaming_config.output_url = Meeting BaaS sends meeting participants' audio TO here → we transcribe
-    # DO NOT set enter_message — Max speaks via voice only, never chat
+    # CRITICAL: input AND output must point to the SAME bidirectional WebSocket URL.
+    # audio_frequency must be the string "16khz" — NOT an integer.
+    # DO NOT set enter_message — Max speaks via voice only, never chat.
+    ws_url = f"wss://{domain}/ws/max"
     payload = {
-        "bot_name":           bot_name,
-        "meeting_url":        meeting_url,
-        "recording_mode":     "audio_only",
-        "streaming_enabled":  True,
-        "streaming_config": {
-            "input_url":       f"wss://{domain}/ws/input/max",
-            "output_url":      f"wss://{domain}/ws/output/max",
-            "audio_frequency": SAMPLE_RATE,   # 16000 Hz
+        "bot_name":       bot_name,
+        "meeting_url":    meeting_url,
+        "recording_mode": "audio_only",
+        "streaming": {
+            "input":           ws_url,
+            "output":          ws_url,
+            "audio_frequency": "16khz",
         },
-        "webhook_url":        f"https://{domain}/webhook",
-        "extra":              {},
+        "webhook_url": f"https://{domain}/webhook",
+        "extra":       {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
