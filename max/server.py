@@ -46,13 +46,21 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 16000                         # 16 kHz PCM
-BUFFER_SECS          = 2.5                           # STT batch window
+BUFFER_SECS          = 1.0                           # STT batch window (shorter = faster response)
 CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit)
+SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive
 
 TRIGGER_RE = re.compile(
-    r"\bmax\b|your (update|turn|standup)|go ahead|"
-    r"what (did|do|have) you|did you (test|check|verify)|"
-    r"any (blockers?|issues?|updates?)|hey max",
+    r"\bmax\b|"                                      # any mention of Max
+    r"your (update|turn|standup|thoughts?)|"
+    r"go ahead|over to you|"
+    r"what (did|do|have|can|will) you|"
+    r"did you (test|check|verify|look)|"
+    r"any (blockers?|issues?|updates?|news)|"
+    r"can you (test|check|look|help|tell)|"
+    r"(hi|hey|hello|yo)\s*(max|there)|"
+    r"are you (there|listening|ready)|"
+    r"can (you|we) hear",
     re.IGNORECASE,
 )
 
@@ -62,6 +70,7 @@ audio_buffers:      dict[str, bytes]         = {}
 conversation:       list[dict]               = []
 pending_tasks:      list[dict]               = []
 test_results:       list[dict]               = []
+recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
 briefing_cache:     str                      = ""   # latest Slack briefing stored by Cowork
 
 # ── Anthropic client ────────────────────────────────────────────────────────────
@@ -347,6 +356,15 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
 
     logger.info(f"🎤 [{bot_id}] {transcript[:100]}")
 
+    # Track recent transcripts for debugging
+    recent_transcripts.append({
+        "text":      transcript[:200],
+        "triggered": bool(TRIGGER_RE.search(transcript)),
+        "at":        time.strftime("%H:%M:%S"),
+    })
+    if len(recent_transcripts) > 20:
+        recent_transcripts.pop(0)
+
     if not TRIGGER_RE.search(transcript):
         return
 
@@ -414,9 +432,9 @@ async def ws_input(websocket: WebSocket, bot_id: str):
     audio_input_queues[bot_id] = queue
     logger.info(f"🔊 Input stream connected — bot: {bot_id}")
 
-    # Greet the team as soon as we're in the meeting
+    # Greet the team quickly once connected
     async def _greet():
-        await asyncio.sleep(2.0)          # let the connection settle first
+        await asyncio.sleep(0.5)          # brief settle
         pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
         if pcm:
             await queue.put(pcm)
@@ -427,13 +445,12 @@ async def ws_input(websocket: WebSocket, bot_id: str):
     try:
         while True:
             try:
-                audio_pcm = await asyncio.wait_for(queue.get(), timeout=30.0)
+                audio_pcm = await asyncio.wait_for(queue.get(), timeout=0.1)
                 await websocket.send_bytes(audio_pcm)
                 logger.info(f"🔊 Sent {len(audio_pcm):,} bytes to meeting")
             except asyncio.TimeoutError:
-                # Send a silent keep-alive frame so Meeting BaaS doesn't drop us
-                silence = b"\x00\x00" * SAMPLE_RATE  # 1s of silence
-                await websocket.send_bytes(silence)
+                # Send continuous silence so Meeting BaaS keeps the audio stream alive
+                await websocket.send_bytes(SILENCE_FRAME)
     except WebSocketDisconnect:
         logger.info(f"🔌 Input stream disconnected — bot: {bot_id}")
         audio_input_queues.pop(bot_id, None)
@@ -596,6 +613,20 @@ async def meeting_baas_webhook(request: Request):
             })
 
     return {"ok": True}
+
+
+# ── Debug ───────────────────────────────────────────────────────────────────────
+
+@app.get("/debug")
+async def debug():
+    """Shows recent STT transcripts — use to verify audio pipeline is working."""
+    return {
+        "active_streams":    len(audio_input_queues),
+        "active_buffers":    {k: len(v) for k, v in audio_buffers.items()},
+        "recent_transcripts": recent_transcripts[-10:],
+        "conversation_turns": len(conversation),
+        "as_of":             time.strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
 
 
 # ── Health ──────────────────────────────────────────────────────────────────────
