@@ -52,8 +52,8 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested str
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
-BUFFER_SECS          = 1.5                           # STT batch window — balance speed vs context
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 72000 bytes at 24kHz
+BUFFER_SECS          = 2.5                           # STT batch window — needs enough context for full sentences
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 120000 bytes at 24kHz
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
 
 TRIGGER_RE = re.compile(
