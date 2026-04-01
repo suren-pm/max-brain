@@ -433,9 +433,8 @@ async def join_meeting(request: Request):
         "meeting_url":    meeting_url,
         "recording_mode": "audio_only",
         "streaming": {
-            "input":           f"wss://{domain}/ws/input/max",
-            "output":          f"wss://{domain}/ws/output/max",
-            "audio_frequency": SAMPLE_RATE,
+            "input":  f"wss://{domain}/ws/input/max",
+            "output": f"wss://{domain}/ws/output/max",
         },
     }
 
