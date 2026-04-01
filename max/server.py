@@ -196,13 +196,14 @@ async def jira_get_ticket(ticket_id: str) -> dict:
 
     async def _try_fetch(tid: str) -> Optional[dict]:
         try:
+            url = f"{base}/rest/api/3/issue/{tid}?fields=summary,status,assignee,priority,description"
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
-                    f"{base}/rest/api/3/issue/{tid}"
-                    f"?fields=summary,status,assignee,priority,description",
+                    url,
                     headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
                     timeout=10,
                 )
+            alog(f"JIRA {tid} → HTTP {resp.status_code}")
             if resp.status_code == 200:
                 d = resp.json()
                 f = d.get("fields", {})
@@ -213,7 +214,11 @@ async def jira_get_ticket(ticket_id: str) -> dict:
                     "assignee": (f.get("assignee") or {}).get("displayName", "unassigned"),
                     "priority": (f.get("priority") or {}).get("name"),
                 }
+            else:
+                alog(f"JIRA FAIL {tid}: {resp.status_code} {resp.text[:100]}")
+                logger.warning(f"Jira {tid}: {resp.status_code} {resp.text[:100]}")
         except Exception as e:
+            alog(f"JIRA EXC {tid}: {e}")
             logger.error(f"Jira fetch error for {tid}: {e}")
         return None
 
@@ -774,6 +779,31 @@ async def meeting_baas_webhook(request: Request):
             })
 
     return {"ok": True}
+
+
+# ── Jira test (temporary diagnostic) ───────────────────────────────────────────
+
+@app.get("/jira-test/{ticket_id}")
+async def jira_test(ticket_id: str):
+    """Direct Jira API test — bypasses Claude/STT to test auth directly."""
+    auth = _jira_auth()
+    if not auth:
+        return {"error": "No auth — JIRA_EMAIL or JIRA_API_TOKEN missing"}
+    base = os.getenv("JIRA_URL", "https://everperform.atlassian.net")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{base}/rest/api/3/issue/{ticket_id}?fields=summary,status",
+                headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
+                timeout=10,
+            )
+        return {
+            "status_code": resp.status_code,
+            "body": resp.json() if resp.status_code == 200 else resp.text[:300],
+            "auth_length": len(auth),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── Debug ───────────────────────────────────────────────────────────────────────
