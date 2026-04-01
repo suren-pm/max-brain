@@ -84,23 +84,34 @@ def alog(msg: str) -> None:
 
 
 # ── Protobuf converter (raw PCM ↔ Pipecat protobuf frames) ───────────────────
+# Uses Pipecat's ProtobufFrameSerializer to avoid duplicate proto registration.
+# The serializer handles Frame ↔ Pipecat internal frame objects.
+
+_serializer = None
+
+def _get_serializer():
+    global _serializer
+    if _serializer is None:
+        from pipecat.serializers.protobuf import ProtobufFrameSerializer
+        _serializer = ProtobufFrameSerializer()
+    return _serializer
 
 def raw_to_protobuf(raw_audio: bytes) -> bytes:
     """Wrap raw PCM audio in a Pipecat protobuf AudioRawFrame."""
-    from max.frames_pb2 import Frame
-    frame = Frame()
-    frame.audio.audio = raw_audio
-    frame.audio.sample_rate = SAMPLE_RATE
-    frame.audio.num_channels = 1
-    return frame.SerializeToString()
+    from pipecat.frames.frames import OutputAudioRawFrame
+    frame = OutputAudioRawFrame(
+        audio=raw_audio,
+        sample_rate=SAMPLE_RATE,
+        num_channels=1,
+    )
+    return _get_serializer().serialize(frame)
 
 def protobuf_to_raw(proto_data: bytes) -> Optional[bytes]:
     """Extract raw PCM audio from a Pipecat protobuf frame."""
-    from max.frames_pb2 import Frame
-    frame = Frame()
-    frame.ParseFromString(proto_data)
-    if frame.HasField("audio"):
-        return bytes(frame.audio.audio)
+    from pipecat.frames.frames import OutputAudioRawFrame, InputAudioRawFrame
+    frame = _get_serializer().deserialize(proto_data)
+    if frame and hasattr(frame, 'audio'):
+        return frame.audio
     return None
 
 
