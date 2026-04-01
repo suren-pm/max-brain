@@ -367,15 +367,29 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
 
 @app.websocket("/ws/output/{bot_id}")
 async def ws_output(websocket: WebSocket, bot_id: str):
-    """Meeting BaaS sends raw 16kHz PCM audio here (what participants say)."""
+    """Meeting BaaS sends raw 16kHz PCM audio here (what participants say).
+    Handles both binary frames (raw PCM) and text frames (JSON with base64 audio)."""
     await websocket.accept()
     audio_buffers[bot_id] = b""
     logger.info(f"🎙️  Output stream connected — bot: {bot_id}")
 
     try:
         while True:
-            data = await websocket.receive_bytes()
-            audio_buffers[bot_id] += data
+            msg = await websocket.receive()
+
+            # Binary frame → raw PCM
+            if "bytes" in msg and msg["bytes"]:
+                audio_buffers[bot_id] += msg["bytes"]
+
+            # Text frame → JSON envelope with base64 audio (Meeting BaaS v2 format)
+            elif "text" in msg and msg["text"]:
+                try:
+                    payload = json.loads(msg["text"])
+                    raw = payload.get("data") or payload.get("audio") or ""
+                    if raw:
+                        audio_buffers[bot_id] += base64.b64decode(raw)
+                except Exception as e:
+                    logger.warning(f"WS text parse error: {e}")
 
             if len(audio_buffers[bot_id]) >= CHUNK_SIZE:
                 chunk = audio_buffers[bot_id]
@@ -384,6 +398,9 @@ async def ws_output(websocket: WebSocket, bot_id: str):
 
     except WebSocketDisconnect:
         logger.info(f"🔌 Output stream disconnected — bot: {bot_id}")
+        audio_buffers.pop(bot_id, None)
+    except Exception as e:
+        logger.error(f"❌ ws_output error: {e}")
         audio_buffers.pop(bot_id, None)
 
 
@@ -397,17 +414,31 @@ async def ws_input(websocket: WebSocket, bot_id: str):
     audio_input_queues[bot_id] = queue
     logger.info(f"🔊 Input stream connected — bot: {bot_id}")
 
+    # Greet the team as soon as we're in the meeting
+    async def _greet():
+        await asyncio.sleep(2.0)          # let the connection settle first
+        pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
+        if pcm:
+            await queue.put(pcm)
+            logger.info("👋 Greeting queued")
+
+    asyncio.create_task(_greet())
+
     try:
         while True:
             try:
-                audio_pcm = await asyncio.wait_for(queue.get(), timeout=60.0)
+                audio_pcm = await asyncio.wait_for(queue.get(), timeout=30.0)
                 await websocket.send_bytes(audio_pcm)
                 logger.info(f"🔊 Sent {len(audio_pcm):,} bytes to meeting")
             except asyncio.TimeoutError:
-                # Connection alive — just waiting for audio
-                pass
+                # Send a silent keep-alive frame so Meeting BaaS doesn't drop us
+                silence = b"\x00\x00" * SAMPLE_RATE  # 1s of silence
+                await websocket.send_bytes(silence)
     except WebSocketDisconnect:
         logger.info(f"🔌 Input stream disconnected — bot: {bot_id}")
+        audio_input_queues.pop(bot_id, None)
+    except Exception as e:
+        logger.error(f"❌ ws_input error: {e}")
         audio_input_queues.pop(bot_id, None)
 
 
