@@ -29,7 +29,6 @@ import asyncio
 import base64
 import json
 import os
-import re
 import time
 from typing import Optional
 
@@ -52,29 +51,9 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested str
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
-BUFFER_SECS          = 2.5                           # STT batch window — needs enough context for full sentences
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 120000 bytes at 24kHz
+BUFFER_SECS          = 1.5                           # STT batch window — reduced from 2.5s for faster response
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 72000 bytes at 24kHz
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
-
-TRIGGER_RE = re.compile(
-    r"\bmax\b|\bamex\b|\bmacs\b|\bmax's\b|\bnext\b|"  # Max + common STT mishearings ("next" = "Max")
-    r"\bmarks?\b|"                                      # more mishearings
-    r"your (update|turn|standup|thoughts?)|"
-    r"go ahead|over to you|"
-    r"what (did|do|have|can|will) you|"
-    r"did you (test|check|verify|look)|"
-    r"any (blockers?|issues?|updates?|news)|"
-    r"can you (test|check|look|help|tell|pick)|"
-    r"(hi|hey|hello|yo)\s*(max|there|amex|next)|"
-    r"are you (there|listening|ready)|"
-    r"can (you|we) hear|"
-    r"pick up.*(ticket|jira|issue|bug)|"               # task assignment
-    r"(ticket|jira|issue|bug).*(pick up|check|test|look|status)|"  # ticket queries
-    r"(check|test|verify|look at)\s*(ticket|jira|ESB|issue)|"      # direct ticket requests
-    r"(ticket|ESB|jira)\s*(number|#)?\s*\d|"           # "ticket 1399", "ESB-1399"
-    r"\b\d{3,5}\b.*\b(test|check|pick|status|fix)",    # "1399 test", "1399 status"
-    re.IGNORECASE,
-)
 
 # ── In-memory state (persists while Railway process runs) ───────────────────────
 audio_input_queues: dict[str, asyncio.Queue] = {}
@@ -453,19 +432,20 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
     alog(f"WS/BIDIR connected bot_id={bot_id}")
     logger.info(f"🎙️  Bidirectional stream connected — bot: {bot_id}")
 
-    # Greet the team once connected — give Meeting BaaS 5s to settle first
+    # Greet the team once connected — give Meeting BaaS 8s to fully establish audio stream
     async def _greet():
         global speaking_until
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(8.0)
         alog("GREET calling TTS...")
-        pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
+        pcm = await text_to_pcm("Hey team! Max here, ready for standup!")
         if pcm:
             frame_size = int(SAMPLE_RATE * 0.1 * 2)
             n = -(-len(pcm) // frame_size)
-            speaking_until = time.time() + (n * 0.1) + 1.5  # echo guard
             for i in range(0, len(pcm), frame_size):
                 await send_queue.put(pcm[i:i + frame_size])
-            alog(f"GREET queued {len(pcm):,}B in {n} frames")
+            # Set echo guard AFTER queuing — guard starts when frames begin sending
+            speaking_until = time.time() + (n * 0.1) + 2.0  # extra buffer for greeting
+            alog(f"GREET queued {len(pcm):,}B in {n} frames (echo guard {n*0.1+2.0:.1f}s)")
             logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
 
     asyncio.create_task(_greet())
