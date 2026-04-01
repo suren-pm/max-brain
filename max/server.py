@@ -207,28 +207,48 @@ async def run_pipecat_pipeline(bot_id: str):
     Connects to ws://localhost:{PORT}/pipecat/{bot_id} as a WebSocket client.
     The /pipecat endpoint bridges to /ws/{bot_id} where Meeting BaaS is connected.
     """
-    from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
-    from pipecat.frames.frames import LLMMessagesFrame
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.runner import PipelineRunner
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
-    from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-    from pipecat.serializers.protobuf import ProtobufFrameSerializer
-    from pipecat.services.anthropic.llm import AnthropicLLMService
-    from pipecat.services.deepgram.stt import DeepgramSTTService
-    from pipecat.services.deepgram.tts import DeepgramTTSService
-    from pipecat.transports.network.websocket_client import (
-        WebsocketClientParams,
-        WebsocketClientTransport,
-    )
-    from pipecat.services.llm_service import FunctionCallParams
-    from pipecat.adapters.schemas.function_schema import FunctionSchema
-    from pipecat.adapters.schemas.tools_schema import ToolsSchema
-    from pipecat.utils.asyncio import TaskManager
-    from max.persona import SYSTEM_PROMPT
+    try:
+        return await _run_pipecat_pipeline_inner(bot_id)
+    except Exception as e:
+        import traceback
+        alog(f"PIPELINE FATAL: {e}")
+        logger.error(f"Pipeline fatal error: {traceback.format_exc()}")
 
-    # Set TaskManager event loop (required by Pipecat)
-    TaskManager.set_event_loop(TaskManager, asyncio.get_running_loop())
+async def _run_pipecat_pipeline_inner(bot_id: str):
+    """Inner pipeline function — separated so errors are always caught."""
+    alog(f"PIPELINE init — importing pipecat modules...")
+    try:
+        from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
+        from pipecat.frames.frames import LLMMessagesFrame
+        from pipecat.pipeline.pipeline import Pipeline
+        from pipecat.pipeline.runner import PipelineRunner
+        from pipecat.pipeline.task import PipelineParams, PipelineTask
+        from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+        from pipecat.serializers.protobuf import ProtobufFrameSerializer
+        from pipecat.services.anthropic.llm import AnthropicLLMService
+        from pipecat.services.deepgram.stt import DeepgramSTTService
+        from pipecat.services.deepgram.tts import DeepgramTTSService
+        from pipecat.transports.network.websocket_client import (
+            WebsocketClientParams,
+            WebsocketClientTransport,
+        )
+        from pipecat.services.llm_service import FunctionCallParams
+        from pipecat.adapters.schemas.function_schema import FunctionSchema
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        from max.persona import SYSTEM_PROMPT
+        alog("PIPELINE imports OK")
+    except ImportError as e:
+        alog(f"PIPELINE IMPORT ERROR: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return
+
+    try:
+        from pipecat.utils.asyncio import TaskManager
+        TaskManager.set_event_loop(TaskManager, asyncio.get_running_loop())
+        alog("PIPELINE TaskManager event loop set")
+    except Exception as e:
+        alog(f"PIPELINE TaskManager error (non-fatal): {e}")
 
     port = os.getenv("PORT", "8080")
     pipecat_ws_url = f"ws://localhost:{port}/pipecat/{bot_id}"
@@ -417,7 +437,13 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     alog(f"WS/MBaaS connected: {bot_id}")
 
     # Start the Pipecat pipeline (connects to /pipecat/{bot_id})
+    # Add done callback to surface any uncaught exceptions
+    def _pipeline_done(t):
+        if t.exception():
+            alog(f"PIPELINE TASK EXCEPTION: {t.exception()}")
+            logger.error(f"Pipeline task exception: {t.exception()}")
     pipeline_task = asyncio.create_task(run_pipecat_pipeline(bot_id))
+    pipeline_task.add_done_callback(_pipeline_done)
 
     try:
         while True:
