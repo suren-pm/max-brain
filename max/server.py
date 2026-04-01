@@ -58,16 +58,21 @@ SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence kee
 
 TRIGGER_RE = re.compile(
     r"\bmax\b|\bamex\b|\bmacs\b|\bmax's\b|\bnext\b|"  # Max + common STT mishearings ("next" = "Max")
-    r"\bmarks?\b|\bmax\s|"                              # more mishearings
+    r"\bmarks?\b|"                                      # more mishearings
     r"your (update|turn|standup|thoughts?)|"
     r"go ahead|over to you|"
     r"what (did|do|have|can|will) you|"
     r"did you (test|check|verify|look)|"
     r"any (blockers?|issues?|updates?|news)|"
-    r"can you (test|check|look|help|tell)|"
+    r"can you (test|check|look|help|tell|pick)|"
     r"(hi|hey|hello|yo)\s*(max|there|amex|next)|"
     r"are you (there|listening|ready)|"
-    r"can (you|we) hear",
+    r"can (you|we) hear|"
+    r"pick up.*(ticket|jira|issue|bug)|"               # task assignment
+    r"(ticket|jira|issue|bug).*(pick up|check|test|look|status)|"  # ticket queries
+    r"(check|test|verify|look at)\s*(ticket|jira|ESB|issue)|"      # direct ticket requests
+    r"(ticket|ESB|jira)\s*(number|#)?\s*\d|"           # "ticket 1399", "ESB-1399"
+    r"\b\d{3,5}\b.*\b(test|check|pick|status|fix)",    # "1399 test", "1399 status"
     re.IGNORECASE,
 )
 
@@ -79,7 +84,6 @@ pending_tasks:      list[dict]               = []
 test_results:       list[dict]               = []
 recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
 briefing_cache:     str                      = ""   # latest Slack briefing stored by Cowork
-last_triggered:     float                    = 0.0  # timestamp of last trigger — conversation window
 
 # ── Audio pipeline counters (for /debug diagnosis) ──────────────────────────────
 audio_log: list[str] = []   # last 30 key events with timestamps
@@ -378,40 +382,45 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
         alog(f"CHUNK EXC: {e}")
         logger.error(f"process_audio_chunk error: {e}")
 
-CONVO_WINDOW_SECS = 30  # after a trigger, keep listening for 30s without needing trigger word
-
 async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
-    global last_triggered
     transcript = await pcm_to_text(pcm)
     if not transcript:
         return
 
     logger.info(f"🎤 [{bot_id}] {transcript[:100]}")
 
-    # Check if we're in conversation window (30s after last trigger)
-    in_convo_window = (time.time() - last_triggered) < CONVO_WINDOW_SECS
+    # Always listen — Max is a team member in the meeting.
+    # TRIGGER_RE determines if Max should RESPOND (speak up).
+    # Non-triggered transcripts are still sent to Claude as context
+    # so Max knows what's being discussed.
     explicit_trigger = bool(TRIGGER_RE.search(transcript))
 
     # Track recent transcripts for debugging
     recent_transcripts.append({
         "text":      transcript[:200],
         "triggered": explicit_trigger,
-        "in_window": in_convo_window,
         "at":        time.strftime("%H:%M:%S"),
     })
     if len(recent_transcripts) > 20:
         recent_transcripts.pop(0)
 
-    if not explicit_trigger and not in_convo_window:
-        return
-
-    # Update conversation window timestamp
-    last_triggered = time.time()
-
-    reason = "TRIGGER" if explicit_trigger else "CONVO_WINDOW"
-    logger.info(f"💬 Max activated ({reason}): {transcript[:80]}")
-    alog(f"{reason}: {transcript[:50]!r}")
-    response = await claude_respond("Team", transcript)
+    if explicit_trigger:
+        # Someone addressed Max or asked him something — respond
+        logger.info(f"💬 Max triggered: {transcript[:80]}")
+        alog(f"TRIGGER: {transcript[:50]!r}")
+        response = await claude_respond("Team", transcript)
+    else:
+        # Not addressed directly — feed to Claude as context (no response)
+        # This way Max hears everything and can reference it when asked
+        conversation.append({
+            "role": "user",
+            "content": f'[Meeting audio — not addressed to Max]: "{transcript}"',
+        })
+        # Keep conversation manageable
+        if len(conversation) > 40:
+            conversation[:] = conversation[-30:]
+        alog(f"CONTEXT: {transcript[:50]!r}")
+        return  # no spoken response
     if not response:
         return
 
@@ -679,13 +688,11 @@ async def meeting_baas_webhook(request: Request):
 @app.get("/debug")
 async def debug():
     """Shows recent STT transcripts — use to verify audio pipeline is working."""
-    convo_remaining = max(0, CONVO_WINDOW_SECS - (time.time() - last_triggered))
     return {
         "active_streams":     len(audio_input_queues),
         "active_buffers":     {k: len(v) for k, v in audio_buffers.items()},
         "recent_transcripts": recent_transcripts[-10:],
         "conversation_turns": len(conversation),
-        "convo_window_secs":  round(convo_remaining, 1),
         "audio_log":          audio_log[-30:],
         "sample_rate":        SAMPLE_RATE,
         "as_of":              time.strftime("%Y-%m-%d %H:%M:%S IST"),
