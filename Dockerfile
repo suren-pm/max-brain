@@ -7,9 +7,8 @@ WORKDIR /app
 COPY requirements-server.txt .
 RUN pip install --no-cache-dir -r requirements-server.txt
 
-# Copy the full project (server.py needs max/persona.py + max_avatar.html)
+# Copy the server package (audio-only — no avatar HTML needed)
 COPY max/ ./max/
-COPY max_avatar.html .
 
 # Railway injects PORT env var — uvicorn binds to it
 ENV PORT=8080
