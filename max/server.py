@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MEETING_BAAS_API     = "https://api.meetingbaas.com"
+MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 16000                         # 16 kHz PCM
