@@ -378,7 +378,12 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
     if audio_pcm:
         queue = audio_input_queues.get(bot_id)
         if queue:
-            await queue.put(audio_pcm)
+            # Split into 100ms frames so Meeting BaaS receives a natural real-time stream
+            # rather than one giant WebSocket message it can't play
+            frame_size = int(SAMPLE_RATE * 0.1 * 2)   # 3200 bytes = 100ms at 16kHz
+            for i in range(0, len(audio_pcm), frame_size):
+                await queue.put(audio_pcm[i:i + frame_size])
+            logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {-(-len(audio_pcm)//frame_size)} frames")
 
 
 # ── WebSocket: Meeting BaaS audio output (meeting → Railway) ────────────────────
@@ -432,13 +437,15 @@ async def ws_input(websocket: WebSocket, bot_id: str):
     audio_input_queues[bot_id] = queue
     logger.info(f"🔊 Input stream connected — bot: {bot_id}")
 
-    # Greet the team quickly once connected
+    # Greet the team quickly once connected — chunked for real-time playback
     async def _greet():
-        await asyncio.sleep(0.5)          # brief settle
+        await asyncio.sleep(0.5)
         pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
         if pcm:
-            await queue.put(pcm)
-            logger.info("👋 Greeting queued")
+            frame_size = int(SAMPLE_RATE * 0.1 * 2)
+            for i in range(0, len(pcm), frame_size):
+                await queue.put(pcm[i:i + frame_size])
+            logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
 
     asyncio.create_task(_greet())
 
