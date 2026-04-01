@@ -459,10 +459,11 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         await asyncio.sleep(2)
         alog("GREETING queued via LLMMessagesFrame")
         try:
-            await task.queue_frame(LLMMessagesFrame([{
-                "role": "user",
-                "content": "You just joined the standup meeting. Introduce yourself briefly with energy!"
-            }]))
+            # Include system prompt — LLMMessagesFrame bypasses context aggregator
+            await task.queue_frame(LLMMessagesFrame([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": "You just joined the standup meeting. Introduce yourself briefly with energy!"},
+            ]))
             alog("GREETING frame queued OK")
         except Exception as e:
             alog(f"GREETING ERROR: {e}")
