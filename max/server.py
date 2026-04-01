@@ -47,6 +47,26 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+import sys
+
+# Capture ALL loguru output (including Pipecat internals) to diag_log
+# This lets us see Deepgram/Claude/Pipecat errors via /debug
+_pipecat_logs: list[str] = []
+
+def _log_sink(message):
+    """Custom loguru sink that captures log messages for /debug endpoint."""
+    text = str(message).strip()
+    # Only capture important pipecat/service messages, not spam
+    if any(kw in text.lower() for kw in ["error", "exception", "fail", "connect", "disconnect",
+                                           "audio", "stt", "tts", "llm", "anthropic", "deepgram",
+                                           "pipeline", "frame", "vad", "transport", "greet"]):
+        ts = time.strftime('%H:%M:%S')
+        entry = f"{ts} [PC] {text[-200:]}"
+        _pipecat_logs.append(entry)
+        if len(_pipecat_logs) > 50:
+            _pipecat_logs.pop(0)
+
+logger.add(_log_sink, level="DEBUG")
 
 app = FastAPI(title="Max Brain Server")
 app.add_middleware(
@@ -676,11 +696,20 @@ async def meeting_baas_webhook(request: Request):
 
 @app.get("/debug")
 async def debug():
+    # Get pipecat version for diagnostics
+    try:
+        import pipecat
+        pc_version = getattr(pipecat, '__version__', 'unknown')
+    except Exception:
+        pc_version = 'not installed'
+
     return {
         "active_pipelines":     active_pipelines,
         "client_connections":   list(client_connections.keys()),
         "pipecat_connections":  list(pipecat_connections.keys()),
         "diag_log":             diag_log[-50:],
+        "pipecat_logs":         _pipecat_logs[-30:],
+        "pipecat_version":      pc_version,
         "pending_tasks":        len(pending_tasks),
         "test_results":         len(test_results),
         "sample_rate":          SAMPLE_RATE,
