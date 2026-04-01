@@ -45,7 +45,7 @@ app.add_middleware(
 MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
-SAMPLE_RATE          = 16000                         # 16 kHz PCM
+SAMPLE_RATE          = 24000                         # 24 kHz PCM (Meeting BaaS default; 16kHz not supported for playback)
 BUFFER_SECS          = 1.0                           # STT batch window (shorter = faster response)
 CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit)
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive
