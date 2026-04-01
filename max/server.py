@@ -323,11 +323,12 @@ async def claude_respond(speaker: str, transcript: str) -> str:
     """Run Claude with tools, return final text response."""
     from max.persona import SYSTEM_PROMPT
 
-    conversation.append({
-        "role":    "user",
-        "content": f'{speaker} says: "{transcript}"',
-    })
-    history = conversation[-20:]  # keep context window manageable
+    # Add user message to conversation
+    user_msg = {"role": "user", "content": f'{speaker} says: "{transcript}"'}
+    conversation.append(user_msg)
+
+    # Keep conversation manageable — only real exchanges (no "..." junk)
+    history = conversation[-20:]
 
     client = get_anthropic()
     msg = await client.messages.create(
@@ -367,8 +368,14 @@ async def claude_respond(speaker: str, transcript: str) -> str:
         block.text for block in msg.content if hasattr(block, "text")
     ).strip()
 
-    if response:
+    # Only save REAL responses to history — NOT silence ("...")
+    # Silence pollutes history and makes Claude think it should keep being silent
+    if response and response.strip() not in ("...", "…", ""):
         conversation.append({"role": "assistant", "content": response})
+    else:
+        # Remove the user message too — don't clutter history with unanswered messages
+        if conversation and conversation[-1] == user_msg:
+            conversation.pop()
 
     return response
 
