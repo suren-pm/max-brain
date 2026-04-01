@@ -317,7 +317,7 @@ async def claude_respond(speaker: str, transcript: str) -> str:
 
     client = get_anthropic()
     msg = await client.messages.create(
-        model="claude-3-5-haiku-20241022",
+        model="claude-haiku-4-5-20251001",
         max_tokens=250,
         system=SYSTEM_PROMPT,
         tools=TOOLS,
@@ -341,7 +341,7 @@ async def claude_respond(speaker: str, transcript: str) -> str:
         history.append({"role": "user",      "content": tool_results})
 
         msg = await client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model="claude-haiku-4-5-20251001",
             max_tokens=250,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
