@@ -459,14 +459,19 @@ async def join_meeting(request: Request):
     if not domain:
         return {"error": "RAILWAY_PUBLIC_DOMAIN env var not set on Railway"}
 
+    # NOTE: streaming_input  = URL where Meeting BaaS SENDS meeting audio to us (bot listens)
+    #       streaming_output = URL where Meeting BaaS READS bot audio from us (bot speaks)
+    # DO NOT set enter_message — Max speaks only via voice, never via chat
     payload = {
-        "bot_name":       bot_name,
-        "meeting_url":    meeting_url,
-        "recording_mode": "audio_only",
-        "streaming": {
-            "input":  f"wss://{domain}/ws/input/max",
-            "output": f"wss://{domain}/ws/output/max",
-        },
+        "bot_name":                        bot_name,
+        "meeting_url":                     meeting_url,
+        "recording_mode":                  "audio_only",
+        "streaming_input":                 f"wss://{domain}/ws/output/max",
+        "streaming_output":                f"wss://{domain}/ws/input/max",
+        "streaming_audio_frequency":       "16khz",
+        "webhook_url":                     f"https://{domain}/webhook",
+        "extra":                           {},
+        "transcription_custom_parameters": {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
@@ -560,6 +565,35 @@ async def post_briefing(request: Request):
 async def get_briefing():
     """Max reads this for standup context."""
     return {"briefing": briefing_cache, "as_of": time.strftime("%Y-%m-%d %H:%M IST")}
+
+
+# ── Meeting BaaS webhook ────────────────────────────────────────────────────────
+
+@app.post("/webhook")
+async def meeting_baas_webhook(request: Request):
+    """Receives Meeting BaaS lifecycle events (bot.joining, transcript.update, etc).
+    Max listens to chat messages here but NEVER replies via chat — voice only."""
+    try:
+        event = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    event_type = event.get("event") or event.get("type", "unknown")
+    logger.info(f"📡 Webhook: {event_type}")
+
+    # Log chat messages from the meeting so Max can use them as context
+    if event_type in ("transcript.update", "chat.message"):
+        speaker = event.get("speaker") or event.get("sender", "Someone")
+        text     = event.get("transcript") or event.get("text", "")
+        if text:
+            logger.info(f"💬 [chat/transcript] {speaker}: {text[:120]}")
+            # Inject into conversation context so Claude can reference it
+            conversation.append({
+                "role":    "user",
+                "content": f'[Meeting chat from {speaker}]: "{text}"',
+            })
+
+    return {"ok": True}
 
 
 # ── Health ──────────────────────────────────────────────────────────────────────
