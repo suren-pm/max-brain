@@ -7,9 +7,11 @@ Audio flow (BIDIRECTIONAL — single WebSocket endpoint):
   Google Meet audio → Meeting BaaS → wss://.../ws/max → Deepgram STT → Claude
   Claude response   → Deepgram TTS → wss://.../ws/max → Meeting BaaS → Google Meet
 
-Meeting BaaS API: POST https://api.meetingbaas.com/bots
-Streaming config:  { "streaming": { "input": url, "output": url, "audio_frequency": "16khz" } }
-Both input AND output point to the SAME bidirectional WebSocket /ws/{bot_id}.
+Meeting BaaS v2 API: POST https://api.meetingbaas.com/v2/bots
+  streaming_enabled: true  (defaults false — MUST set explicitly!)
+  streaming_config: { input_url, output_url, audio_frequency: 24000 }
+  audio_frequency supports: 24000, 32000, 48000 Hz (NOT 16000!)
+Both input_url AND output_url point to the SAME bidirectional WebSocket /ws/{bot_id}.
 
 Endpoints:
   POST /join           → trigger Max to join a meeting
@@ -46,13 +48,13 @@ app.add_middleware(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — uses top-level streaming_input/streaming_output fields
+MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested streaming_config
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
-SAMPLE_RATE          = 16000                         # 16 kHz — confirmed working in speaking-meeting-bot
+SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
 BUFFER_SECS          = 1.0                           # STT batch window
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit)
-SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 48000 bytes at 24kHz
+SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
 
 TRIGGER_RE = re.compile(
     r"\bmax\b|\bamex\b|\bmacs\b|\bmax's\b|"          # Max + common STT mishearings
@@ -102,7 +104,7 @@ def get_anthropic() -> anthropic_sdk.AsyncAnthropic:
 # ── Deepgram helpers ────────────────────────────────────────────────────────────
 
 async def pcm_to_text(pcm_bytes: bytes) -> str:
-    """Transcribe raw 16kHz linear16 PCM via Deepgram batch STT."""
+    """Transcribe raw 24kHz linear16 PCM via Deepgram batch STT."""
     key = os.getenv("DEEPGRAM_API_KEY")
     if not key:
         return ""
@@ -131,7 +133,7 @@ async def pcm_to_text(pcm_bytes: bytes) -> str:
 
 
 async def text_to_pcm(text: str) -> bytes:
-    """Generate 16kHz linear16 PCM from text via Deepgram TTS."""
+    """Generate 24kHz linear16 PCM from text via Deepgram TTS."""
     key = os.getenv("DEEPGRAM_API_KEY")
     if not key:
         return b""
@@ -513,20 +515,24 @@ async def join_meeting(request: Request):
     if not domain:
         return {"error": "RAILWAY_PUBLIC_DOMAIN env var not set on Railway"}
 
-    # v2 API: streaming fields are TOP-LEVEL (not nested).
-    # streaming_input = Meeting BaaS sends our TTS here to play in meeting.
-    # streaming_output = Meeting BaaS sends meeting audio here for STT.
-    # Both point to the SAME bidirectional WebSocket. "16khz" is a string enum.
+    # v2 API (from SDK v6.0.5): streaming_enabled MUST be true (defaults false!),
+    # and streaming config uses NESTED streaming_config object.
+    # input_url = where MBaaS reads our TTS audio to play in meeting.
+    # output_url = where MBaaS sends meeting audio for our STT.
+    # audio_frequency = integer Hz. Supported: 24000 (default), 32000, 48000.
     ws_url = f"wss://{domain}/ws/max"
     payload = {
-        "bot_name":                  bot_name,
-        "meeting_url":               meeting_url,
-        "recording_mode":            "audio_only",
-        "streaming_input":           ws_url,
-        "streaming_output":          ws_url,
-        "streaming_audio_frequency": "16khz",
-        "webhook_url":               f"https://{domain}/webhook",
-        "extra":                     {},
+        "bot_name":          bot_name,
+        "meeting_url":       meeting_url,
+        "recording_mode":    "audio_only",
+        "streaming_enabled": True,
+        "streaming_config": {
+            "input_url":       ws_url,
+            "output_url":      ws_url,
+            "audio_frequency": SAMPLE_RATE,
+        },
+        "webhook_url":       f"https://{domain}/webhook",
+        "extra":             {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
