@@ -459,19 +459,21 @@ async def join_meeting(request: Request):
     if not domain:
         return {"error": "RAILWAY_PUBLIC_DOMAIN env var not set on Railway"}
 
-    # NOTE: streaming_input  = URL where Meeting BaaS SENDS meeting audio to us (bot listens)
-    #       streaming_output = URL where Meeting BaaS READS bot audio from us (bot speaks)
-    # DO NOT set enter_message — Max speaks only via voice, never via chat
+    # streaming_config.input_url  = Meeting BaaS reads bot TTS audio FROM here → plays in meeting
+    # streaming_config.output_url = Meeting BaaS sends meeting participants' audio TO here → we transcribe
+    # DO NOT set enter_message — Max speaks via voice only, never chat
     payload = {
-        "bot_name":                        bot_name,
-        "meeting_url":                     meeting_url,
-        "recording_mode":                  "audio_only",
-        "streaming_input":                 f"wss://{domain}/ws/output/max",
-        "streaming_output":                f"wss://{domain}/ws/input/max",
-        "streaming_audio_frequency":       "16khz",
-        "webhook_url":                     f"https://{domain}/webhook",
-        "extra":                           {},
-        "transcription_custom_parameters": {},
+        "bot_name":           bot_name,
+        "meeting_url":        meeting_url,
+        "recording_mode":     "audio_only",
+        "streaming_enabled":  True,
+        "streaming_config": {
+            "input_url":       f"wss://{domain}/ws/input/max",
+            "output_url":      f"wss://{domain}/ws/output/max",
+            "audio_frequency": SAMPLE_RATE,   # 16000 Hz
+        },
+        "webhook_url":        f"https://{domain}/webhook",
+        "extra":              {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
