@@ -46,7 +46,7 @@ app.add_middleware(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MEETING_BAAS_API     = "https://api.meetingbaas.com"   # old API (not /v2) — supports streaming: {input, output}
+MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — uses top-level streaming_input/streaming_output fields
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 16000                         # 16 kHz — confirmed working in speaking-meeting-bot
@@ -513,21 +513,20 @@ async def join_meeting(request: Request):
     if not domain:
         return {"error": "RAILWAY_PUBLIC_DOMAIN env var not set on Railway"}
 
-    # CRITICAL: input AND output must point to the SAME bidirectional WebSocket URL.
-    # audio_frequency must be the string "16khz" — NOT an integer.
-    # DO NOT set enter_message — Max speaks via voice only, never chat.
+    # v2 API: streaming fields are TOP-LEVEL (not nested).
+    # streaming_input = Meeting BaaS sends our TTS here to play in meeting.
+    # streaming_output = Meeting BaaS sends meeting audio here for STT.
+    # Both point to the SAME bidirectional WebSocket. "16khz" is a string enum.
     ws_url = f"wss://{domain}/ws/max"
     payload = {
-        "bot_name":       bot_name,
-        "meeting_url":    meeting_url,
-        "recording_mode": "audio_only",
-        "streaming": {
-            "input":           ws_url,
-            "output":          ws_url,
-            "audio_frequency": "16khz",
-        },
-        "webhook_url": f"https://{domain}/webhook",
-        "extra":       {},
+        "bot_name":                  bot_name,
+        "meeting_url":               meeting_url,
+        "recording_mode":            "audio_only",
+        "streaming_input":           ws_url,
+        "streaming_output":          ws_url,
+        "streaming_audio_frequency": "16khz",
+        "webhook_url":               f"https://{domain}/webhook",
+        "extra":                     {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
