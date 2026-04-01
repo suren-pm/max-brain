@@ -438,9 +438,9 @@ async def ws_input(websocket: WebSocket, bot_id: str):
     audio_input_queues[bot_id] = queue
     logger.info(f"🔊 Input stream connected — bot: {bot_id}")
 
-    # Greet the team quickly once connected — chunked for real-time playback
+    # Greet the team once connected — give Meeting BaaS 1s to settle first
     async def _greet():
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.0)
         pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
         if pcm:
             frame_size = int(SAMPLE_RATE * 0.1 * 2)
@@ -452,13 +452,19 @@ async def ws_input(websocket: WebSocket, bot_id: str):
 
     try:
         while True:
+            # Always pace at real-time: one 100ms frame per 100ms tick.
+            # IMPORTANT: get_nowait() so we never block here — the sleep below
+            # is what enforces the 100ms cadence regardless of queue depth.
+            # Without this sleep, queued TTS audio (e.g. 20 frames) would all
+            # be sent in one burst, and Meeting BaaS cannot play a burst dump.
             try:
-                audio_pcm = await asyncio.wait_for(queue.get(), timeout=0.1)
+                audio_pcm = queue.get_nowait()
                 await websocket.send_bytes(audio_pcm)
                 logger.info(f"🔊 Sent {len(audio_pcm):,} bytes to meeting")
-            except asyncio.TimeoutError:
-                # Send continuous silence so Meeting BaaS keeps the audio stream alive
+            except asyncio.QueueEmpty:
+                # No speech queued — send silence to keep the stream alive
                 await websocket.send_bytes(SILENCE_FRAME)
+            await asyncio.sleep(0.1)  # real-time pacing: 100ms per frame
     except WebSocketDisconnect:
         logger.info(f"🔌 Input stream disconnected — bot: {bot_id}")
         audio_input_queues.pop(bot_id, None)
