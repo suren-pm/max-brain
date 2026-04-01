@@ -52,19 +52,20 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested str
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
-BUFFER_SECS          = 1.0                           # STT batch window
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 48000 bytes at 24kHz
+BUFFER_SECS          = 3.0                           # STT batch window — 3s gives STT more context
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 144000 bytes at 24kHz
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
 
 TRIGGER_RE = re.compile(
-    r"\bmax\b|\bamex\b|\bmacs\b|\bmax's\b|"          # Max + common STT mishearings
+    r"\bmax\b|\bamex\b|\bmacs\b|\bmax's\b|\bnext\b|"  # Max + common STT mishearings ("next" = "Max")
+    r"\bmarks?\b|\bmax\s|"                              # more mishearings
     r"your (update|turn|standup|thoughts?)|"
     r"go ahead|over to you|"
     r"what (did|do|have|can|will) you|"
     r"did you (test|check|verify|look)|"
     r"any (blockers?|issues?|updates?|news)|"
     r"can you (test|check|look|help|tell)|"
-    r"(hi|hey|hello|yo)\s*(max|there|amex)|"
+    r"(hi|hey|hello|yo)\s*(max|there|amex|next)|"
     r"are you (there|listening|ready)|"
     r"can (you|we) hear",
     re.IGNORECASE,
@@ -471,16 +472,15 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
 
     async def send_loop():
         """Send TTS audio (or silence keepalive) to Meeting BaaS at real-time pace.
-        Sends one frame per 100ms tick. When speech is queued, sends speech;
-        otherwise sends silence to keep the stream alive."""
+        One frame per 100ms tick — MUST sleep after each send for real-time pacing."""
         while True:
             try:
-                # Wait up to 100ms for a speech frame
-                audio_pcm = await asyncio.wait_for(send_queue.get(), timeout=0.1)
+                audio_pcm = send_queue.get_nowait()
                 await websocket.send_bytes(audio_pcm)
-            except asyncio.TimeoutError:
-                # No speech queued — send silence keepalive
+            except asyncio.QueueEmpty:
+                # No speech queued — send silence to keep the stream alive
                 await websocket.send_bytes(SILENCE_FRAME)
+            await asyncio.sleep(0.1)  # real-time pacing: 100ms per frame — DO NOT REMOVE
 
     recv_task = asyncio.create_task(receive_loop())
     send_task = asyncio.create_task(send_loop())
