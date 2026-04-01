@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Max — AI Test Engineer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 1280px; height: 720px; overflow: hidden;
+      background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+      display: flex; align-items: center; justify-content: center;
+      font-family: 'Segoe UI', system-ui, sans-serif; color: white;
+    }
+    .glow-ring {
+      position: absolute; border-radius: 50%;
+      border: 1px solid rgba(99,102,241,0.15);
+      animation: pulse-ring 4s ease-in-out infinite;
+    }
+    .glow-ring:nth-child(1){width:500px;height:500px;animation-delay:0s}
+    .glow-ring:nth-child(2){width:620px;height:620px;animation-delay:0.7s}
+    .glow-ring:nth-child(3){width:740px;height:740px;animation-delay:1.4s}
+    @keyframes pulse-ring {
+      0%,100%{transform:scale(1);opacity:.3} 50%{transform:scale(1.04);opacity:.6}
+    }
+    .card {
+      position:relative;z-index:10;display:flex;
+      flex-direction:column;align-items:center;gap:28px;
+    }
+    .avatar-wrap { position:relative;width:220px;height:220px; }
+    .avatar-circle {
+      width:220px;height:220px;border-radius:50%;
+      background:linear-gradient(145deg,#4f46e5,#7c3aed,#2563eb);
+      display:flex;align-items:center;justify-content:center;
+      font-size:88px;font-weight:800;letter-spacing:-4px;
+      box-shadow:0 0 0 4px rgba(79,70,229,.4),0 0 40px rgba(124,58,237,.5),0 20px 60px rgba(0,0,0,.5);
+      transition:transform .15s ease;position:relative;overflow:hidden;
+    }
+    .avatar-circle::before {
+      content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
+      background:linear-gradient(45deg,transparent 30%,rgba(255,255,255,.07) 50%,transparent 70%);
+      animation:shimmer 3s linear infinite;
+    }
+    @keyframes shimmer{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+    .speaking-ring {
+      position:absolute;inset:-8px;border-radius:50%;
+      border:3px solid #818cf8;opacity:0;transition:opacity .2s;
+    }
+    .speaking .speaking-ring{opacity:1;animation:speaking-pulse .6s ease-in-out infinite alternate}
+    @keyframes speaking-pulse{
+      from{transform:scale(1);border-color:#818cf8;box-shadow:0 0 20px rgba(129,140,248,.4)}
+      to{transform:scale(1.06);border-color:#a78bfa;box-shadow:0 0 35px rgba(167,139,250,.7)}
+    }
+    .speaking .avatar-circle{transform:scale(1.03)}
+    .listen-dots {
+      display:flex;gap:6px;position:absolute;bottom:-28px;
+      left:50%;transform:translateX(-50%);opacity:0;transition:opacity .3s;
+    }
+    .listening .listen-dots{opacity:1}
+    .dot {
+      width:8px;height:8px;border-radius:50%;background:#34d399;
+      animation:dot-bounce 1.2s ease-in-out infinite;
+    }
+    .dot:nth-child(2){animation-delay:.2s}.dot:nth-child(3){animation-delay:.4s}
+    @keyframes dot-bounce{0%,80%,100%{transform:translateY(0);opacity:.5}40%{transform:translateY(-8px);opacity:1}}
+    .name-block{text-align:center}
+    .name {
+      font-size:36px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+      background:linear-gradient(90deg,#a5b4fc,#e0e7ff,#c4b5fd);
+      -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+    }
+    .role{font-size:15px;color:rgba(199,210,254,.7);letter-spacing:3px;text-transform:uppercase;margin-top:6px}
+    .status-badge {
+      display:flex;align-items:center;gap:8px;padding:8px 20px;
+      border-radius:99px;background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.1);font-size:13px;
+      color:rgba(199,210,254,.8);letter-spacing:.5px;backdrop-filter:blur(10px);transition:all .3s;
+    }
+    .status-dot{width:8px;height:8px;border-radius:50%;background:#34d399;animation:status-blink 2s ease-in-out infinite}
+    @keyframes status-blink{0%,100%{opacity:1}50%{opacity:.3}}
+    .sound-bars{display:flex;align-items:flex-end;gap:4px;height:24px;opacity:0;transition:opacity .3s}
+    .speaking-active .sound-bars{opacity:1}
+    .bar{width:4px;border-radius:2px;background:linear-gradient(to top,#4f46e5,#a78bfa);animation:sound-bar .5s ease-in-out infinite alternate}
+    .bar:nth-child(1){height:8px;animation-delay:.00s}.bar:nth-child(2){height:16px;animation-delay:.10s}
+    .bar:nth-child(3){height:22px;animation-delay:.05s}.bar:nth-child(4){height:14px;animation-delay:.15s}
+    .bar:nth-child(5){height:10px;animation-delay:.08s}
+    @keyframes sound-bar{from{transform:scaleY(.3)}to{transform:scaleY(1)}}
+    .powered{position:absolute;bottom:20px;right:24px;font-size:11px;color:rgba(255,255,255,.2);letter-spacing:1px}
+  </style>
+</head>
+<body>
+  <div class="glow-ring"></div>
+  <div class="glow-ring"></div>
+  <div class="glow-ring"></div>
+  <div class="card">
+    <div class="avatar-wrap" id="avatar-wrap">
+      <div class="avatar-circle">M</div>
+      <div class="speaking-ring"></div>
+      <div class="listen-dots">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+      </div>
+    </div>
+    <div class="name-block">
+      <div class="name">Max</div>
+      <div class="role">AI Test Automation Engineer</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px" id="bottom-row">
+      <div class="status-badge" id="status-badge">
+        <div class="status-dot"></div>
+        <span id="status-text">Ready</span>
+      </div>
+      <div class="sound-bars">
+        <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+        <div class="bar"></div><div class="bar"></div>
+      </div>
+    </div>
+  </div>
+  <div class="powered">EVERPERFORM · MAX AI</div>
+
+  <script>
+    // ── Config (injected by server.py or URL params) ──────────────────────
+    const params     = new URLSearchParams(window.location.search);
+    const SERVER_URL = window.MAX_SERVER_URL || params.get('server') || null;
+    const BOT_ID     = window.MAX_BOT_ID     || params.get('bot_id') || 'max';
+
+    // ── DOM refs ──────────────────────────────────────────────────────────
+    const wrap   = document.getElementById('avatar-wrap');
+    const badge  = document.getElementById('status-badge');
+    const status = document.getElementById('status-text');
+    const row    = document.getElementById('bottom-row');
+
+    function setState(state, text) {
+      wrap.className  = 'avatar-wrap '  + (state || '');
+      badge.className = 'status-badge ' + (state || '');
+      if (text) status.textContent = text;
+      row.classList.toggle('speaking-active', state === 'speaking');
+    }
+
+    // ── Audio queue (prevents overlapping speech) ─────────────────────────
+    let audioQueue = [];
+    let isSpeaking = false;
+
+    function enqueue(item) {   // item = { text, audio } or just text string
+      audioQueue.push(item);
+      drainQueue();
+    }
+
+    function drainQueue() {
+      if (isSpeaking || audioQueue.length === 0) return;
+      isSpeaking = true;
+      const item = audioQueue.shift();
+      const text  = typeof item === 'string' ? item : item.text;
+      const audio = typeof item === 'object'  ? item.audio : null;
+      setState('speaking', 'Speaking...');
+      if (audio) {
+        playBase64(audio).then(onDone).catch(() => fallbackTTS(text));
+      } else {
+        fallbackTTS(text);
+      }
+    }
+
+    function onDone() {
+      isSpeaking = false;
+      setState('listening', 'Listening...');
+      drainQueue();
+    }
+
+    // ── Primary: play server-generated base64 MP3 via AudioContext ────────
+    let sharedCtx = null;
+
+    async function playBase64(b64) {
+      // Try HTML5 Audio first (simpler)
+      try {
+        await playHtml5Audio(b64);
+        return;
+      } catch (_) {}
+      // Fall back to AudioContext
+      if (!sharedCtx) sharedCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (sharedCtx.state === 'suspended') await sharedCtx.resume();
+      const binary = atob(b64);
+      const bytes  = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const buffer = await sharedCtx.decodeAudioData(bytes.buffer);
+      return new Promise((resolve) => {
+        const src = sharedCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(sharedCtx.destination);
+        src.onended = resolve;
+        src.start();
+      });
+    }
+
+    function playHtml5Audio(b64) {
+      return new Promise((resolve, reject) => {
+        const audio = new Audio('data:audio/mp3;base64,' + b64);
+        audio.onended  = resolve;
+        audio.onerror  = reject;
+        audio.play().catch(reject);
+      });
+    }
+
+    // ── Fallback: Web Speech API (works on desktop, may not in headless) ──
+    function fallbackTTS(text) {
+      if (!window.speechSynthesis) { onDone(); return; }
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 0.95; u.pitch = 1.0; u.volume = 1.0;
+      const voices = window.speechSynthesis.getVoices();
+      const v = voices.find(v => v.lang.startsWith('en') &&
+        (v.name.includes('Google') || v.name.includes('Daniel') || v.name.includes('Alex')));
+      if (v) u.voice = v;
+      u.onend   = onDone;
+      u.onerror = onDone;
+      window.speechSynthesis.speak(u);
+    }
+
+    // ── Poll server for Max's queued responses ────────────────────────────
+    function startPolling() {
+      if (!SERVER_URL) return;
+      setInterval(async () => {  // 500ms poll for faster response
+        try {
+          const res  = await fetch(`${SERVER_URL}/speech/${BOT_ID}`, { cache: 'no-store' });
+          const data = await res.json();
+          if (data.text) enqueue(data);   // data = { text, audio }
+        } catch (_) {}
+      }, 500);
+    }
+
+    // ── On load: greet + start polling immediately ────────────────────────
+    window.addEventListener('load', async () => {
+      setState('listening', 'Ready');
+
+      // Start polling immediately — does NOT wait for TTS
+      startPolling();
+
+      // Fetch greeting from server (includes Deepgram TTS audio)
+      if (SERVER_URL) {
+        try {
+          const res  = await fetch(`${SERVER_URL}/greet/${BOT_ID}`);
+          const data = await res.json();
+          if (data.text) enqueue(data);
+        } catch (e) {
+          // Server unreachable — do a silent greeting via fallback TTS
+          fallbackTTS("Good morning team. I'm Max, ready for standup.");
+        }
+      }
+    });
+  </script>
+</body>
+</html>
