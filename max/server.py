@@ -149,6 +149,7 @@ async def text_to_pcm(text: str) -> bytes:
         alog(f"TTS FAIL {resp.status_code}: {resp.text[:60]}")
         logger.warning(f"TTS {resp.status_code}: {resp.text[:80]}")
     except Exception as e:
+        alog(f"TTS EXC: {e}")
         logger.error(f"TTS error: {e}")
     return b""
 
@@ -362,6 +363,13 @@ async def claude_respond(speaker: str, transcript: str) -> str:
 
 async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
     """STT → trigger check → Claude → TTS → queue audio for Meeting BaaS."""
+    try:
+     return await _process_audio_chunk_inner(bot_id, pcm)
+    except Exception as e:
+        alog(f"CHUNK EXC: {e}")
+        logger.error(f"process_audio_chunk error: {e}")
+
+async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
     transcript = await pcm_to_text(pcm)
     if not transcript:
         return
@@ -386,6 +394,7 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
         return
 
     logger.info(f"🤖 Max: {response[:100]}")
+    alog(f"RESPONSE TTS: {response[:60]!r}")
     audio_pcm = await text_to_pcm(response)
     if audio_pcm:
         queue = audio_input_queues.get(bot_id)
