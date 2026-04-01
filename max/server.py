@@ -781,13 +781,17 @@ async def meeting_baas_webhook(request: Request):
 @app.get("/debug")
 async def debug():
     """Shows recent STT transcripts — use to verify audio pipeline is working."""
+    # Check Jira token health (don't expose the token itself)
+    jira_token = os.getenv("JIRA_API_TOKEN", "")
     return {
         "active_streams":     len(audio_input_queues),
         "active_buffers":     {k: len(v) for k, v in audio_buffers.items()},
         "recent_transcripts": recent_transcripts[-10:],
         "conversation_turns": len(conversation),
-        "audio_log":          audio_log[-30:],
+        "audio_log":          audio_log[-50:],
         "sample_rate":        SAMPLE_RATE,
+        "jira_token_length":  len(jira_token),
+        "jira_token_ends":    jira_token[-10:] if jira_token else "NOT SET",
         "as_of":              time.strftime("%Y-%m-%d %H:%M:%S IST"),
     }
 
