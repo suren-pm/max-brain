@@ -65,13 +65,20 @@ test_results:       list[dict]               = []
 recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
 briefing_cache:     str                      = ""   # latest Slack briefing stored by Cowork
 
+# ── Transcript accumulator ─────────────────────────────────────────────────────
+# Collects STT fragments and waits for a pause before sending to Claude.
+# Fixes sentence-splitting: "Can you give me" + "your updates Max" → one message.
+ACCUMULATOR_PAUSE   = 2.0   # seconds of silence before flushing to Claude
+transcript_fragments: list[str] = []
+_flush_task: Optional[asyncio.Task] = None
+
 # ── Audio pipeline counters (for /debug diagnosis) ──────────────────────────────
-audio_log: list[str] = []   # last 30 key events with timestamps
+audio_log: list[str] = []   # last 50 key events with timestamps
 
 def alog(msg: str) -> None:
-    """Append a timestamped event to audio_log (capped at 30 entries)."""
+    """Append a timestamped event to audio_log (capped at 50 entries)."""
     audio_log.append(f"{time.strftime('%H:%M:%S')} {msg}")
-    if len(audio_log) > 30:
+    if len(audio_log) > 50:
         audio_log.pop(0)
 
 # ── Anthropic client ────────────────────────────────────────────────────────────
@@ -370,7 +377,7 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
         logger.error(f"process_audio_chunk error: {e}")
 
 async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
-    global speaking_until
+    global speaking_until, _flush_task
 
     # ── Echo suppression: skip audio while Max is speaking ──
     if time.time() < speaking_until:
@@ -391,9 +398,34 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
     if len(recent_transcripts) > 20:
         recent_transcripts.pop(0)
 
-    # Send EVERYTHING to Claude — let Claude decide if Max should respond.
     alog(f"STT: {transcript[:50]!r}")
-    response = await claude_respond("Team", transcript)
+
+    # ── Accumulate fragments and wait for pause before sending to Claude ──
+    # This prevents "Can you give me" + "your updates" from being sent as 2 separate messages.
+    transcript_fragments.append(transcript)
+
+    # Cancel any pending flush — speaker is still talking
+    if _flush_task and not _flush_task.done():
+        _flush_task.cancel()
+
+    # Schedule a flush after ACCUMULATOR_PAUSE seconds of silence
+    _flush_task = asyncio.create_task(_flush_accumulated(bot_id))
+
+
+async def _flush_accumulated(bot_id: str) -> None:
+    """Wait for a pause, then send all accumulated fragments to Claude as one message."""
+    global speaking_until
+    await asyncio.sleep(ACCUMULATOR_PAUSE)
+
+    if not transcript_fragments:
+        return
+
+    # Join all fragments into one complete message
+    full_transcript = " ".join(transcript_fragments)
+    transcript_fragments.clear()
+
+    alog(f"FLUSH to Claude: {full_transcript[:80]!r}")
+    response = await claude_respond("Team", full_transcript)
     if not response or response.strip() in ("...", "…", ""):
         alog(f"SILENT (Claude chose not to respond)")
         return
@@ -435,18 +467,25 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
     # Greet the team once connected — give Meeting BaaS 8s to fully establish audio stream
     async def _greet():
         global speaking_until
-        await asyncio.sleep(8.0)
-        alog("GREET calling TTS...")
-        pcm = await text_to_pcm("Hey team! Max here, ready for standup!")
-        if pcm:
-            frame_size = int(SAMPLE_RATE * 0.1 * 2)
-            n = -(-len(pcm) // frame_size)
-            for i in range(0, len(pcm), frame_size):
-                await send_queue.put(pcm[i:i + frame_size])
-            # Set echo guard AFTER queuing — guard starts when frames begin sending
-            speaking_until = time.time() + (n * 0.1) + 2.0  # extra buffer for greeting
-            alog(f"GREET queued {len(pcm):,}B in {n} frames (echo guard {n*0.1+2.0:.1f}s)")
-            logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
+        try:
+            await asyncio.sleep(8.0)
+            alog("GREET calling TTS...")
+            pcm = await text_to_pcm("Hey team! Max here, ready for standup!")
+            if pcm:
+                frame_size = int(SAMPLE_RATE * 0.1 * 2)
+                n = -(-len(pcm) // frame_size)
+                for i in range(0, len(pcm), frame_size):
+                    await send_queue.put(pcm[i:i + frame_size])
+                # Set echo guard AFTER queuing — guard starts when frames begin sending
+                speaking_until = time.time() + (n * 0.1) + 2.0  # extra buffer for greeting
+                alog(f"GREET queued {len(pcm):,}B in {n} frames (echo guard {n*0.1+2.0:.1f}s)")
+                logger.info(f"👋 Greeting queued ({len(pcm):,} bytes)")
+            else:
+                alog("GREET FAILED — TTS returned empty audio")
+                logger.error("Greeting TTS returned empty audio")
+        except Exception as e:
+            alog(f"GREET EXCEPTION: {e}")
+            logger.error(f"Greeting error: {e}")
 
     asyncio.create_task(_greet())
 
