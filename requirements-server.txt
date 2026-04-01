@@ -1,0 +1,10 @@
+# Max Brain Server — Railway deployment
+# Lightweight: no Pipecat, no Daily.co, no Recall.ai
+# Stack: Meeting BaaS WebSocket audio + Deepgram STT/TTS + Claude + FastAPI
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0   # includes websockets support
+anthropic>=0.40.0
+httpx>=0.28.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
