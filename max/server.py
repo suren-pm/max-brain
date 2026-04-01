@@ -84,34 +84,46 @@ def alog(msg: str) -> None:
 
 
 # ── Protobuf converter (raw PCM ↔ Pipecat protobuf frames) ───────────────────
-# Uses Pipecat's ProtobufFrameSerializer to avoid duplicate proto registration.
-# The serializer handles Frame ↔ Pipecat internal frame objects.
+# Uses Pipecat's INTERNAL protobuf module (pipecat.frames.protobufs.frames_pb2)
+# to avoid duplicate proto registration errors.
 
-_serializer = None
+_frame_protos = None
 
-def _get_serializer():
-    global _serializer
-    if _serializer is None:
-        from pipecat.serializers.protobuf import ProtobufFrameSerializer
-        _serializer = ProtobufFrameSerializer()
-    return _serializer
+def _get_protos():
+    global _frame_protos
+    if _frame_protos is None:
+        try:
+            # Pipecat >= 0.0.50 path
+            import pipecat.frames.protobufs.frames_pb2 as fp
+            _frame_protos = fp
+            alog("PROTO: loaded from pipecat.frames.protobufs.frames_pb2")
+        except ImportError:
+            try:
+                # Older Pipecat path
+                import pipecat.serializers.protobuf_serializer as ps
+                _frame_protos = ps.frame_protos
+                alog("PROTO: loaded from pipecat.serializers (fallback)")
+            except ImportError as e:
+                alog(f"PROTO IMPORT FAILED: {e}")
+                raise
+    return _frame_protos
 
 def raw_to_protobuf(raw_audio: bytes) -> bytes:
     """Wrap raw PCM audio in a Pipecat protobuf AudioRawFrame."""
-    from pipecat.frames.frames import OutputAudioRawFrame
-    frame = OutputAudioRawFrame(
-        audio=raw_audio,
-        sample_rate=SAMPLE_RATE,
-        num_channels=1,
-    )
-    return _get_serializer().serialize(frame)
+    fp = _get_protos()
+    frame = fp.Frame()
+    frame.audio.audio = raw_audio
+    frame.audio.sample_rate = SAMPLE_RATE
+    frame.audio.num_channels = 1
+    return frame.SerializeToString()
 
 def protobuf_to_raw(proto_data: bytes) -> Optional[bytes]:
     """Extract raw PCM audio from a Pipecat protobuf frame."""
-    from pipecat.frames.frames import OutputAudioRawFrame, InputAudioRawFrame
-    frame = _get_serializer().deserialize(proto_data)
-    if frame and hasattr(frame, 'audio'):
-        return frame.audio
+    fp = _get_protos()
+    frame = fp.Frame()
+    frame.ParseFromString(proto_data)
+    if frame.HasField("audio"):
+        return bytes(frame.audio.audio)
     return None
 
 
@@ -482,7 +494,12 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
                         proto = raw_to_protobuf(raw_audio)
                         await pipecat_ws.send_bytes(proto)
                     except Exception as e:
-                        logger.debug(f"Error forwarding to Pipecat: {e}")
+                        alog(f"BRIDGE MBaaS→Pipecat ERROR: {e}")
+                else:
+                    # Log once that pipecat isn't connected yet
+                    if not hasattr(ws_meetingbaas, '_logged_no_pipecat'):
+                        alog(f"BRIDGE: MBaaS sending audio but Pipecat not connected yet")
+                        ws_meetingbaas._logged_no_pipecat = True
 
     except WebSocketDisconnect:
         alog(f"WS/MBaaS disconnected: {bot_id}")
@@ -517,14 +534,16 @@ async def ws_pipecat(websocket: WebSocket, bot_id: str):
 
             if "bytes" in msg and msg["bytes"]:
                 # Pipecat sends protobuf → extract raw audio → forward to MBaaS
-                audio = protobuf_to_raw(msg["bytes"])
-                if audio:
-                    client_ws = client_connections.get(bot_id)
-                    if client_ws:
-                        try:
+                try:
+                    audio = protobuf_to_raw(msg["bytes"])
+                    if audio:
+                        client_ws = client_connections.get(bot_id)
+                        if client_ws:
                             await client_ws.send_bytes(audio)
-                        except Exception as e:
-                            logger.debug(f"Error forwarding to MBaaS: {e}")
+                        else:
+                            alog(f"BRIDGE Pipecat→MBaaS: no MBaaS connection")
+                except Exception as e:
+                    alog(f"BRIDGE Pipecat→MBaaS ERROR: {e}")
 
     except WebSocketDisconnect:
         alog(f"WS/Pipecat disconnected: {bot_id}")
