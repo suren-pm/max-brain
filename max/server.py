@@ -80,6 +80,7 @@ TRIGGER_RE = re.compile(
 audio_input_queues: dict[str, asyncio.Queue] = {}
 audio_buffers:      dict[str, bytes]         = {}
 conversation:       list[dict]               = []
+speaking_until:     float                    = 0.0  # timestamp when Max finishes speaking — suppress echo
 pending_tasks:      list[dict]               = []
 test_results:       list[dict]               = []
 recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
@@ -383,6 +384,13 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
         logger.error(f"process_audio_chunk error: {e}")
 
 async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
+    global speaking_until
+
+    # ── Echo suppression: skip audio while Max is speaking ──
+    if time.time() < speaking_until:
+        alog(f"ECHO SKIP (Max still speaking, {speaking_until - time.time():.1f}s left)")
+        return
+
     transcript = await pcm_to_text(pcm)
     if not transcript:
         return
@@ -398,7 +406,6 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
         recent_transcripts.pop(0)
 
     # Send EVERYTHING to Claude — let Claude decide if Max should respond.
-    # Claude's persona tells him to only speak when addressed or relevant.
     alog(f"STT: {transcript[:50]!r}")
     response = await claude_respond("Team", transcript)
     if not response or response.strip() in ("...", "…", ""):
@@ -413,9 +420,11 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
         if queue:
             frame_size = int(SAMPLE_RATE * 0.1 * 2)
             n_frames = -(-len(audio_pcm) // frame_size)
+            # Set echo suppression: block incoming audio while Max speaks + 1.5s buffer
+            speaking_until = time.time() + (n_frames * 0.1) + 1.5
             for i in range(0, len(audio_pcm), frame_size):
                 await queue.put(audio_pcm[i:i + frame_size])
-            alog(f"QUEUED {len(audio_pcm):,}B in {n_frames} frames for {bot_id}")
+            alog(f"QUEUED {len(audio_pcm):,}B in {n_frames} frames for {bot_id} (echo guard {n_frames*0.1+1.5:.1f}s)")
             logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {n_frames} frames")
         else:
             alog(f"QUEUE MISS — no ws connected for bot_id={bot_id} (keys={list(audio_input_queues.keys())})")
@@ -437,14 +446,16 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
     alog(f"WS/BIDIR connected bot_id={bot_id}")
     logger.info(f"🎙️  Bidirectional stream connected — bot: {bot_id}")
 
-    # Greet the team once connected — give Meeting BaaS 1s to settle first
+    # Greet the team once connected — give Meeting BaaS 5s to settle first
     async def _greet():
+        global speaking_until
         await asyncio.sleep(5.0)
         alog("GREET calling TTS...")
         pcm = await text_to_pcm("Hey team! Max here. Ready for standup.")
         if pcm:
             frame_size = int(SAMPLE_RATE * 0.1 * 2)
             n = -(-len(pcm) // frame_size)
+            speaking_until = time.time() + (n * 0.1) + 1.5  # echo guard
             for i in range(0, len(pcm), frame_size):
                 await send_queue.put(pcm[i:i + frame_size])
             alog(f"GREET queued {len(pcm):,}B in {n} frames")
