@@ -52,8 +52,8 @@ MEETING_BAAS_API     = "https://api.meetingbaas.com/v2"  # v2 API — nested str
 DEEPGRAM_TTS_MODEL   = "aura-arcas-en"
 DEEPGRAM_STT_MODEL   = "nova-2-conversationalai"
 SAMPLE_RATE          = 24000                         # 24 kHz — v2 API supports 24000/32000/48000 only (NOT 16000)
-BUFFER_SECS          = 2.0                           # STT batch window — 2s balances speed vs transcript quality
-CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 96000 bytes at 24kHz
+BUFFER_SECS          = 1.5                           # STT batch window — 1.5s for faster turn detection
+CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit) = 72000 bytes at 24kHz
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive = 4800 bytes
 
 # ── In-memory state (persists while Railway process runs) ───────────────────────
@@ -62,17 +62,16 @@ audio_buffers:      dict[str, bytes]         = {}
 conversation:       list[dict]               = []
 speaking_until:     float                    = 0.0  # timestamp when Max finishes speaking — suppress echo
 greeting_sent:      bool                     = False  # prevent double greeting
+first_audio_received: bool                   = False  # triggers greeting on first real audio
 pending_tasks:      list[dict]               = []
 test_results:       list[dict]               = []
 recent_transcripts: list[dict]               = []   # last 20 STT results for debugging
 briefing_cache:     str                      = ""   # latest Slack briefing stored by Cowork
 
-# ── Transcript accumulator ─────────────────────────────────────────────────────
-# Collects STT fragments and waits for a pause before sending to Claude.
-# Fixes sentence-splitting: "Can you give me" + "your updates Max" → one message.
-ACCUMULATOR_PAUSE   = 3.0   # seconds of silence before flushing to Claude (2.0 was too short — users pause mid-sentence)
-transcript_fragments: list[str] = []
-_flush_task: Optional[asyncio.Task] = None
+# ── Conversation awareness ─────────────────────────────────────────────────────
+# Track when Max last spoke so Claude knows it's in an active conversation.
+last_response_time: float = 0.0       # timestamp of Max's last spoken response
+CONVERSATION_WINDOW = 30.0            # seconds — if Max spoke within this window, stay engaged
 
 # ── Audio pipeline counters (for /debug diagnosis) ──────────────────────────────
 audio_log: list[str] = []       # ALL events (capped at 50)
@@ -362,12 +361,21 @@ async def run_tool(name: str, inputs: dict) -> str:
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
-async def claude_respond(speaker: str, transcript: str) -> str:
+async def claude_respond(speaker: str, transcript: str, in_conversation: bool = False) -> str:
     """Run Claude with tools, return final text response."""
     from max.persona import SYSTEM_PROMPT
 
-    # Add user message to conversation
-    user_msg = {"role": "user", "content": f'{speaker} says: "{transcript}"'}
+    # Build context-aware message. Include recent STT fragments so Claude can
+    # piece together fragmented sentences like "Right. Can you" + "testing again."
+    recent = [t["text"] for t in recent_transcripts[-5:]]
+    context_hint = ""
+    if in_conversation:
+        context_hint = " [You just spoke — this is a follow-up in an active conversation. Respond even if the message seems incomplete.]"
+    if len(recent) > 1:
+        # Show recent speech context so Claude can understand fragments
+        context_hint += f' [Recent speech context: {" / ".join(recent[:-1])}]'
+
+    user_msg = {"role": "user", "content": f'{speaker} says: "{transcript}"{context_hint}'}
     conversation.append(user_msg)
 
     # Keep conversation manageable — only real exchanges (no "..." junk)
@@ -434,7 +442,7 @@ async def process_audio_chunk(bot_id: str, pcm: bytes) -> None:
         logger.error(f"process_audio_chunk error: {e}")
 
 async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
-    global speaking_until, _flush_task
+    global speaking_until, last_response_time
 
     # ── Echo suppression: skip audio while Max is speaking ──
     if time.time() < speaking_until:
@@ -444,6 +452,9 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
     transcript = await pcm_to_text(pcm)
     if not transcript:
         return
+
+    # Clean STT artifacts IMMEDIATELY (Mike→Max, fragmented numbers, etc.)
+    transcript = _clean_transcript(transcript)
 
     logger.info(f"🎤 [{bot_id}] {transcript[:100]}")
 
@@ -457,16 +468,34 @@ async def _process_audio_chunk_inner(bot_id: str, pcm: bytes) -> None:
 
     alog(f"STT: {transcript[:50]!r}")
 
-    # ── Accumulate fragments and wait for pause before sending to Claude ──
-    # This prevents "Can you give me" + "your updates" from being sent as 2 separate messages.
-    transcript_fragments.append(transcript)
+    # ── Conversation awareness: is Max in an active conversation? ──
+    in_convo = (time.time() - last_response_time) < CONVERSATION_WINDOW
 
-    # Cancel any pending flush — speaker is still talking
-    if _flush_task and not _flush_task.done():
-        _flush_task.cancel()
+    # ── Send directly to Claude (no accumulator — it caused more dead ends) ──
+    response = await claude_respond("Team", transcript, in_conversation=in_convo)
+    if not response or response.strip() in ("...", "…", ""):
+        alog(f"SILENT (Claude chose not to respond)")
+        return
 
-    # Schedule a flush after ACCUMULATOR_PAUSE seconds of silence
-    _flush_task = asyncio.create_task(_flush_accumulated(bot_id))
+    # Max is responding — update conversation awareness timer
+    last_response_time = time.time()
+
+    logger.info(f"🤖 Max: {response[:100]}")
+    alog(f"RESPONSE TTS: {response[:60]!r}")
+    audio_pcm = await text_to_pcm(response)
+    if audio_pcm:
+        queue = audio_input_queues.get(bot_id)
+        if queue:
+            frame_size = int(SAMPLE_RATE * 0.1 * 2)
+            n_frames = -(-len(audio_pcm) // frame_size)
+            # Set echo suppression: block incoming audio while Max speaks + 1.5s buffer
+            speaking_until = time.time() + (n_frames * 0.1) + 1.5
+            for i in range(0, len(audio_pcm), frame_size):
+                await queue.put(audio_pcm[i:i + frame_size])
+            alog(f"QUEUED {len(audio_pcm):,}B in {n_frames} frames for {bot_id} (echo guard {n_frames*0.1+1.5:.1f}s)")
+            logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {n_frames} frames")
+        else:
+            alog(f"QUEUE MISS — no ws connected for bot_id={bot_id} (keys={list(audio_input_queues.keys())})")
 
 
 def _clean_transcript(text: str) -> str:
@@ -493,41 +522,6 @@ def _clean_transcript(text: str) -> str:
     return text
 
 
-async def _flush_accumulated(bot_id: str) -> None:
-    """Wait for a pause, then send all accumulated fragments to Claude as one message."""
-    global speaking_until
-    await asyncio.sleep(ACCUMULATOR_PAUSE)
-
-    if not transcript_fragments:
-        return
-
-    # Join all fragments into one complete message and clean up STT artifacts
-    full_transcript = _clean_transcript(" ".join(transcript_fragments))
-    transcript_fragments.clear()
-
-    alog(f"FLUSH to Claude: {full_transcript[:80]!r}")
-    response = await claude_respond("Team", full_transcript)
-    if not response or response.strip() in ("...", "…", ""):
-        alog(f"SILENT (Claude chose not to respond)")
-        return
-
-    logger.info(f"🤖 Max: {response[:100]}")
-    alog(f"RESPONSE TTS: {response[:60]!r}")
-    audio_pcm = await text_to_pcm(response)
-    if audio_pcm:
-        queue = audio_input_queues.get(bot_id)
-        if queue:
-            frame_size = int(SAMPLE_RATE * 0.1 * 2)
-            n_frames = -(-len(audio_pcm) // frame_size)
-            # Set echo suppression: block incoming audio while Max speaks + 1.5s buffer
-            speaking_until = time.time() + (n_frames * 0.1) + 1.5
-            for i in range(0, len(audio_pcm), frame_size):
-                await queue.put(audio_pcm[i:i + frame_size])
-            alog(f"QUEUED {len(audio_pcm):,}B in {n_frames} frames for {bot_id} (echo guard {n_frames*0.1+1.5:.1f}s)")
-            logger.info(f"🔊 Queued {len(audio_pcm):,} bytes in {n_frames} frames")
-        else:
-            alog(f"QUEUE MISS — no ws connected for bot_id={bot_id} (keys={list(audio_input_queues.keys())})")
-
 
 # ── WebSocket: bidirectional audio with Meeting BaaS ───────────────────────────
 
@@ -545,44 +539,43 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
     alog(f"WS/BIDIR connected bot_id={bot_id}")
     logger.info(f"🎙️  Bidirectional stream connected — bot: {bot_id}")
 
-    # Greet the team once audio is confirmed working.
-    async def _greet():
-        global speaking_until, greeting_sent
-        try:
-            # Only greet once — prevents double greeting if multiple bots join
-            if greeting_sent:
-                alog("GREET skipped — already greeted")
-                return
-            greeting_sent = True
-            # Wait 10s for MBaaS to fully establish the audio stream
-            await asyncio.sleep(10.0)
-            alog("GREET generating...")
-            greeting_text = "Hey team! Max here, ready to crush some testing today!"
-            audio_pcm = await text_to_pcm(greeting_text)
-            if audio_pcm:
-                frame_size = int(SAMPLE_RATE * 0.1 * 2)
-                n = -(-len(audio_pcm) // frame_size)
-                speaking_until = time.time() + (n * 0.1) + 2.0
-                for i in range(0, len(audio_pcm), frame_size):
-                    await send_queue.put(audio_pcm[i:i + frame_size])
-                alog(f"GREET queued {len(audio_pcm):,}B in {n} frames")
-                # Also add to conversation so Claude knows Max already greeted
-                conversation.append({"role": "assistant", "content": greeting_text})
-            else:
-                alog("GREET FAILED — TTS returned empty")
-        except Exception as e:
-            alog(f"GREET EXC: {e}")
-            logger.error(f"Greeting error: {e}")
+    # Greeting is now triggered by _try_greet_on_first_audio() inside receive_loop
+    # instead of a blind timer. This ensures MBaaS is fully ready to play audio.
 
-    asyncio.create_task(_greet())
+    async def _try_greet_on_first_audio():
+        """Trigger greeting after first real audio arrives (MBaaS is ready).
+        Wait 3s after first audio so the stream is stable before sending TTS."""
+        global speaking_until, greeting_sent, first_audio_received, last_response_time
+        if greeting_sent:
+            return
+        greeting_sent = True
+        first_audio_received = True
+        await asyncio.sleep(3.0)  # short wait — MBaaS is already streaming
+        alog("GREET generating (triggered by first audio)...")
+        greeting_text = "Hey team! Max here, ready to crush some testing today!"
+        audio_pcm = await text_to_pcm(greeting_text)
+        if audio_pcm:
+            frame_size = int(SAMPLE_RATE * 0.1 * 2)
+            n = -(-len(audio_pcm) // frame_size)
+            speaking_until = time.time() + (n * 0.1) + 2.0
+            last_response_time = time.time()  # greeting counts as conversation start
+            for i in range(0, len(audio_pcm), frame_size):
+                await send_queue.put(audio_pcm[i:i + frame_size])
+            alog(f"GREET queued {len(audio_pcm):,}B in {n} frames")
+            conversation.append({"role": "assistant", "content": greeting_text})
+        else:
+            alog("GREET FAILED — TTS returned empty")
 
     async def receive_loop():
         """Receive meeting audio from Meeting BaaS and buffer for STT."""
+        greet_triggered = False
         while True:
             msg = await websocket.receive()
+            got_audio = False
             # Binary frame → raw PCM
             if "bytes" in msg and msg["bytes"]:
                 audio_buffers[bot_id] += msg["bytes"]
+                got_audio = True
             # Text frame → JSON envelope with base64 audio
             elif "text" in msg and msg["text"]:
                 try:
@@ -590,9 +583,15 @@ async def ws_bidirectional(websocket: WebSocket, bot_id: str):
                     raw = data.get("data") or data.get("audio") or ""
                     if raw:
                         audio_buffers[bot_id] += base64.b64decode(raw)
+                        got_audio = True
                 except Exception as e:
                     logger.warning(f"WS text parse error: {e}")
-            # Flush buffer to STT when we have 1 second of audio
+            # Trigger greeting on first real audio from MBaaS
+            if got_audio and not greet_triggered:
+                greet_triggered = True
+                alog("FIRST AUDIO received — triggering greeting")
+                asyncio.create_task(_try_greet_on_first_audio())
+            # Flush buffer to STT when we have enough audio
             if len(audio_buffers[bot_id]) >= CHUNK_SIZE:
                 chunk = audio_buffers[bot_id]
                 audio_buffers[bot_id] = b""
@@ -829,6 +828,9 @@ async def debug():
             for m in conversation[-5:]
         ],
         "diag_log":           diag_log[-50:],
+        "last_response_ago":  f"{time.time() - last_response_time:.1f}s" if last_response_time else "never",
+        "in_conversation":    (time.time() - last_response_time) < CONVERSATION_WINDOW if last_response_time else False,
+        "greeting_sent":      greeting_sent,
         "sample_rate":        SAMPLE_RATE,
         "jira_token_length":  len(jira_token),
         "jira_token_ends":    jira_token[-10:] if jira_token else "NOT SET",
