@@ -75,13 +75,20 @@ transcript_fragments: list[str] = []
 _flush_task: Optional[asyncio.Task] = None
 
 # ── Audio pipeline counters (for /debug diagnosis) ──────────────────────────────
-audio_log: list[str] = []   # last 50 key events with timestamps
+audio_log: list[str] = []       # ALL events (capped at 50)
+diag_log:  list[str] = []       # Important events only — no SENT spam (capped at 50)
 
 def alog(msg: str) -> None:
     """Append a timestamped event to audio_log (capped at 50 entries)."""
-    audio_log.append(f"{time.strftime('%H:%M:%S')} {msg}")
+    ts = time.strftime('%H:%M:%S')
+    audio_log.append(f"{ts} {msg}")
     if len(audio_log) > 50:
         audio_log.pop(0)
+    # Also log important events separately (skip SENT spam)
+    if not msg.startswith("SENT "):
+        diag_log.append(f"{ts} {msg}")
+        if len(diag_log) > 50:
+            diag_log.pop(0)
 
 # ── Anthropic client ────────────────────────────────────────────────────────────
 _anthropic: Optional[anthropic_sdk.AsyncAnthropic] = None
@@ -810,15 +817,18 @@ async def jira_test(ticket_id: str):
 
 @app.get("/debug")
 async def debug():
-    """Shows recent STT transcripts — use to verify audio pipeline is working."""
-    # Check Jira token health (don't expose the token itself)
+    """Shows diagnostic info — diag_log has important events without SENT spam."""
     jira_token = os.getenv("JIRA_API_TOKEN", "")
     return {
         "active_streams":     len(audio_input_queues),
         "active_buffers":     {k: len(v) for k, v in audio_buffers.items()},
         "recent_transcripts": recent_transcripts[-10:],
         "conversation_turns": len(conversation),
-        "audio_log":          audio_log[-50:],
+        "conversation_last5": [
+            {"role": m["role"], "content": str(m["content"])[:150]}
+            for m in conversation[-5:]
+        ],
+        "diag_log":           diag_log[-50:],
         "sample_rate":        SAMPLE_RATE,
         "jira_token_length":  len(jira_token),
         "jira_token_ends":    jira_token[-10:] if jira_token else "NOT SET",
