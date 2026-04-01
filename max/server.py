@@ -51,14 +51,14 @@ CHUNK_SIZE           = int(SAMPLE_RATE * BUFFER_SECS * 2)  # bytes (16-bit)
 SILENCE_FRAME        = b"\x00\x00" * int(SAMPLE_RATE * 0.1)  # 100ms silence keep-alive
 
 TRIGGER_RE = re.compile(
-    r"\bmax\b|"                                      # any mention of Max
+    r"\bmax\b|\bamex\b|\bmacs\b|\bmax's\b|"          # Max + common STT mishearings
     r"your (update|turn|standup|thoughts?)|"
     r"go ahead|over to you|"
     r"what (did|do|have|can|will) you|"
     r"did you (test|check|verify|look)|"
     r"any (blockers?|issues?|updates?|news)|"
     r"can you (test|check|look|help|tell)|"
-    r"(hi|hey|hello|yo)\s*(max|there)|"
+    r"(hi|hey|hello|yo)\s*(max|there|amex)|"
     r"are you (there|listening|ready)|"
     r"can (you|we) hear",
     re.IGNORECASE,
@@ -98,7 +98,8 @@ async def pcm_to_text(pcm_bytes: bytes) -> str:
             resp = await client.post(
                 f"https://api.deepgram.com/v1/listen"
                 f"?model={DEEPGRAM_STT_MODEL}&encoding=linear16"
-                f"&sample_rate={SAMPLE_RATE}&language=en&smart_format=true",
+                f"&sample_rate={SAMPLE_RATE}&language=en&smart_format=true"
+                f"&keywords=Max:10&keywords=Jira:5&keywords=EverPerform:5&keywords=ESB:5",
                 headers={
                     "Authorization": f"Token {key}",
                     "Content-Type": "audio/raw",
