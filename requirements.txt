@@ -1,0 +1,17 @@
+# Max AI Employee - Dependencies
+
+# Core framework (includes all service integrations)
+pipecat-ai[anthropic,google,deepgram,cartesia,kokoro,daily,silero]>=0.0.108
+
+# Meeting BaaS for Google Meet / Zoom / Teams joining
+httpx>=0.28.0
+websockets>=13.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Jira integration (for standup context)
+atlassian-python-api>=3.41.0
+
+# Async utilities
+aiohttp>=3.9.0

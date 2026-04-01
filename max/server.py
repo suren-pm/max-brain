@@ -59,7 +59,9 @@ def _log_sink(message):
     # Only capture important pipecat/service messages, not spam
     if any(kw in text.lower() for kw in ["error", "exception", "fail", "connect", "disconnect",
                                            "audio", "stt", "tts", "llm", "anthropic", "deepgram",
-                                           "pipeline", "frame", "vad", "transport", "greet"]):
+                                           "pipeline", "frame", "vad", "transport", "greet",
+                                           "websocket", "sample", "running", "start", "stop",
+                                           "close", "timeout", "queue", "processing"]):
         ts = time.strftime('%H:%M:%S')
         entry = f"{ts} [PC] {text[-200:]}"
         _pipecat_logs.append(entry)
@@ -271,10 +273,19 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         from pipecat.services.anthropic.llm import AnthropicLLMService
         from pipecat.services.deepgram.stt import DeepgramSTTService
         from pipecat.services.deepgram.tts import DeepgramTTSService
-        from pipecat.transports.network.websocket_client import (
-            WebsocketClientParams,
-            WebsocketClientTransport,
-        )
+        # Try both import paths for WebSocket transport (changed between versions)
+        try:
+            from pipecat.transports.websocket.client import (
+                WebsocketClientParams,
+                WebsocketClientTransport,
+            )
+            alog("IMPORT: websocket transport from pipecat.transports.websocket.client")
+        except ImportError:
+            from pipecat.transports.network.websocket_client import (
+                WebsocketClientParams,
+                WebsocketClientTransport,
+            )
+            alog("IMPORT: websocket transport from pipecat.transports.network.websocket_client (fallback)")
         from pipecat.services.llm_service import FunctionCallParams
         from pipecat.adapters.schemas.function_schema import FunctionSchema
         from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -308,13 +319,12 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=16000,
                 params=VADParams(
-                    threshold=0.5,
-                    min_speech_duration_ms=250,
-                    min_silence_duration_ms=300,
-                    min_volume=0.6,
+                    threshold=0.4,
+                    min_speech_duration_ms=200,
+                    min_silence_duration_ms=400,
+                    min_volume=0.2,
                 ),
             ),
-            audio_in_passthrough=True,
             serializer=ProtobufFrameSerializer(),
             timeout=300,
         ),
@@ -448,10 +458,14 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     async def send_greeting():
         await asyncio.sleep(2)
         alog("GREETING queued via LLMMessagesFrame")
-        await task.queue_frames([LLMMessagesFrame([{
-            "role": "user",
-            "content": "You just joined the standup meeting. Introduce yourself briefly with energy!"
-        }])])
+        try:
+            await task.queue_frame(LLMMessagesFrame([{
+                "role": "user",
+                "content": "You just joined the standup meeting. Introduce yourself briefly with energy!"
+            }]))
+            alog("GREETING frame queued OK")
+        except Exception as e:
+            alog(f"GREETING ERROR: {e}")
 
     asyncio.create_task(send_greeting())
 
@@ -478,6 +492,7 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     await websocket.accept()
     client_connections[bot_id] = websocket
     alog(f"WS/MBaaS connected: {bot_id}")
+    audio_chunks_in = 0
 
     # Start the Pipecat pipeline (connects to /pipecat/{bot_id})
     # Add done callback to surface any uncaught exceptions
@@ -507,6 +522,10 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
                     pass
 
             if raw_audio:
+                audio_chunks_in += 1
+                # Log first few chunks and then every 100th
+                if audio_chunks_in <= 3 or audio_chunks_in % 100 == 0:
+                    alog(f"BRIDGE MBaaS→Pipecat: chunk #{audio_chunks_in} ({len(raw_audio)} bytes)")
                 # Forward to Pipecat as protobuf frame
                 pipecat_ws = pipecat_connections.get(bot_id)
                 if pipecat_ws:
@@ -516,10 +535,8 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
                     except Exception as e:
                         alog(f"BRIDGE MBaaS→Pipecat ERROR: {e}")
                 else:
-                    # Log once that pipecat isn't connected yet
-                    if not hasattr(ws_meetingbaas, '_logged_no_pipecat'):
-                        alog(f"BRIDGE: MBaaS sending audio but Pipecat not connected yet")
-                        ws_meetingbaas._logged_no_pipecat = True
+                    if audio_chunks_in <= 3:
+                        alog(f"BRIDGE: MBaaS audio but Pipecat not connected yet (chunk #{audio_chunks_in})")
 
     except WebSocketDisconnect:
         alog(f"WS/MBaaS disconnected: {bot_id}")
@@ -545,6 +562,8 @@ async def ws_pipecat(websocket: WebSocket, bot_id: str):
     await websocket.accept()
     pipecat_connections[bot_id] = websocket
     alog(f"WS/Pipecat connected: {bot_id}")
+    audio_chunks_out = 0
+    non_audio_frames = 0
 
     try:
         while True:
@@ -557,11 +576,18 @@ async def ws_pipecat(websocket: WebSocket, bot_id: str):
                 try:
                     audio = protobuf_to_raw(msg["bytes"])
                     if audio:
+                        audio_chunks_out += 1
+                        if audio_chunks_out <= 3 or audio_chunks_out % 100 == 0:
+                            alog(f"BRIDGE Pipecat→MBaaS: chunk #{audio_chunks_out} ({len(audio)} bytes)")
                         client_ws = client_connections.get(bot_id)
                         if client_ws:
                             await client_ws.send_bytes(audio)
                         else:
                             alog(f"BRIDGE Pipecat→MBaaS: no MBaaS connection")
+                    else:
+                        non_audio_frames += 1
+                        if non_audio_frames <= 5:
+                            alog(f"BRIDGE Pipecat→MBaaS: non-audio frame (#{non_audio_frames}, {len(msg['bytes'])} bytes)")
                 except Exception as e:
                     alog(f"BRIDGE Pipecat→MBaaS ERROR: {e}")
 
