@@ -592,6 +592,9 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
         except (asyncio.CancelledError, Exception):
             pass
         closing_clients.discard(bot_id)
+        # Post standup notes to callback if any were captured
+        if standup_notes:
+            asyncio.create_task(_post_meeting_notes_callback())
         alog(f"WS/MBaaS cleanup done: {bot_id}")
 
 
@@ -760,6 +763,43 @@ async def get_notes():
 async def clear_notes():
     standup_notes.clear()
     return {"ok": True, "message": "Notes cleared"}
+
+@app.get("/notes/summary")
+async def get_notes_summary():
+    """Get a formatted Slack-ready summary of standup notes."""
+    if not standup_notes:
+        return {"summary": "No notes captured this standup.", "notes": []}
+    lines = [f"*Standup Notes — {time.strftime('%d %b %Y')}*\n"]
+    for n in standup_notes:
+        line = f"• *{n.get('speaker', '?')}* ({n.get('timestamp', '')}): {n.get('summary', '')}"
+        actions = n.get("action_items", "")
+        if actions:
+            line += f"\n   ↳ _Action: {actions}_"
+        lines.append(line)
+    return {"summary": "\n".join(lines), "notes": standup_notes}
+
+
+async def _post_meeting_notes_callback():
+    """Called when Max exits a meeting — posts notes to the configured callback."""
+    callback_url = os.getenv("NOTES_CALLBACK_URL", "")
+    if not callback_url or not standup_notes:
+        alog(f"NOTES CALLBACK: skipped (url={'set' if callback_url else 'unset'}, notes={len(standup_notes)})")
+        return
+    # Build Slack-formatted summary
+    lines = [f"*:memo: Max's Standup Notes — {time.strftime('%d %b %Y %H:%M IST')}*\n"]
+    for n in standup_notes:
+        line = f"• *{n.get('speaker', '?')}* ({n.get('timestamp', '')}): {n.get('summary', '')}"
+        actions = n.get("action_items", "")
+        if actions:
+            line += f"\n   ↳ _Action: {actions}_"
+        lines.append(line)
+    summary = "\n".join(lines)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(callback_url, json={"text": summary}, timeout=10)
+        alog(f"NOTES CALLBACK: posted to webhook — HTTP {resp.status_code}")
+    except Exception as e:
+        alog(f"NOTES CALLBACK ERROR: {e}")
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
