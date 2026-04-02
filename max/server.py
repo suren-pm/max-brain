@@ -86,12 +86,14 @@ SAMPLE_RATE      = 24000
 pending_tasks:  list[dict] = []
 test_results:   list[dict] = []
 briefing_cache: str        = ""
+standup_notes:  list[dict] = []  # Max's live standup notes
 
 # ── Connection registry (MBaaS ↔ Pipecat bridge) ─────────────────────────────
 client_connections: dict[str, WebSocket] = {}   # bot_id → MBaaS WebSocket
 pipecat_connections: dict[str, WebSocket] = {}  # bot_id → Pipecat WebSocket
 closing_clients: set[str] = set()
 active_pipelines: dict[str, dict] = {}
+audio_ready_events: dict[str, asyncio.Event] = {}  # signals when MBaaS audio is flowing
 
 # ── Diagnostic logging ────────────────────────────────────────────────────────
 diag_log: list[str] = []
@@ -377,11 +379,23 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             "pending_tasks":   [t for t in pending_tasks if t.get("status") == "pending"],
         }))
 
+    async def tool_save_standup_note(params: FunctionCallParams):
+        note = {
+            "speaker":    params.arguments.get("speaker", "unknown"),
+            "summary":    params.arguments.get("summary", ""),
+            "action_items": params.arguments.get("action_items", ""),
+            "timestamp":  time.strftime("%H:%M IST"),
+        }
+        standup_notes.append(note)
+        alog(f"NOTE saved: {note['speaker']} — {note['summary'][:60]}")
+        await params.result_callback(json.dumps({"ok": True, "note": note, "total_notes": len(standup_notes)}))
+
     llm.register_function("get_jira_ticket", tool_get_jira_ticket)
     llm.register_function("get_testing_tickets", tool_get_testing_tickets)
     llm.register_function("log_task", tool_log_task)
     llm.register_function("get_test_results", tool_get_test_results)
     llm.register_function("get_standup_briefing", tool_get_standup_briefing)
+    llm.register_function("save_standup_note", tool_save_standup_note)
 
     # ── Tool schemas ──
     tools = ToolsSchema(standard_tools=[
@@ -420,6 +434,16 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             properties={},
             required=[],
         ),
+        FunctionSchema(
+            name="save_standup_note",
+            description="Save a note from what someone said in standup. Use this to capture updates, blockers, and action items as people give their updates.",
+            properties={
+                "speaker":      {"type": "string", "description": "Who is speaking (e.g. 'Suren', 'Dev Team')"},
+                "summary":      {"type": "string", "description": "Brief summary of what they said"},
+                "action_items": {"type": "string", "description": "Any action items or follow-ups mentioned (empty string if none)"},
+            },
+            required=["speaker", "summary"],
+        ),
     ])
 
     # ── TTS: Deepgram streaming WebSocket ──
@@ -454,8 +478,16 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         ),
     )
 
-    # ── Greeting after 2s ──
+    # ── Greeting: wait for audio bridge to be ready, then greet ──
     async def send_greeting():
+        evt = audio_ready_events.get(bot_id)
+        if evt:
+            try:
+                await asyncio.wait_for(evt.wait(), timeout=15)
+                alog("GREETING: audio bridge confirmed ready")
+            except asyncio.TimeoutError:
+                alog("GREETING: timeout waiting for audio, greeting anyway")
+        # Extra buffer for MBaaS to fully establish bidirectional audio
         await asyncio.sleep(2)
         alog("GREETING queued via LLMMessagesFrame")
         try:
@@ -492,6 +524,7 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     """Meeting BaaS connects here — sends/receives raw PCM audio."""
     await websocket.accept()
     client_connections[bot_id] = websocket
+    audio_ready_events[bot_id] = asyncio.Event()
     alog(f"WS/MBaaS connected: {bot_id}")
     audio_chunks_in = 0
 
@@ -524,6 +557,12 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
 
             if raw_audio:
                 audio_chunks_in += 1
+                # Signal audio is flowing after 10 chunks (~1s of audio)
+                if audio_chunks_in == 10:
+                    evt = audio_ready_events.get(bot_id)
+                    if evt:
+                        evt.set()
+                        alog(f"AUDIO READY: MBaaS audio flowing for {bot_id}")
                 # Log first few chunks and then every 100th
                 if audio_chunks_in <= 3 or audio_chunks_in % 100 == 0:
                     alog(f"BRIDGE MBaaS→Pipecat: chunk #{audio_chunks_in} ({len(raw_audio)} bytes)")
@@ -546,6 +585,7 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     finally:
         closing_clients.add(bot_id)
         client_connections.pop(bot_id, None)
+        audio_ready_events.pop(bot_id, None)
         pipeline_task.cancel()
         try:
             await pipeline_task
@@ -704,6 +744,22 @@ async def post_briefing(request: Request):
 @app.get("/briefing")
 async def get_briefing():
     return {"briefing": briefing_cache, "as_of": time.strftime("%Y-%m-%d %H:%M IST")}
+
+
+# ── Standup notes endpoints ──────────────────────────────────────────────────
+
+@app.get("/notes")
+async def get_notes():
+    return {
+        "notes":      standup_notes,
+        "total":      len(standup_notes),
+        "as_of":      time.strftime("%Y-%m-%d %H:%M IST"),
+    }
+
+@app.delete("/notes")
+async def clear_notes():
+    standup_notes.clear()
+    return {"ok": True, "message": "Notes cleared"}
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
