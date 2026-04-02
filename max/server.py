@@ -488,7 +488,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             except asyncio.TimeoutError:
                 alog("GREETING: timeout waiting for audio, greeting anyway")
         # Extra buffer for MBaaS to fully establish bidirectional audio
-        await asyncio.sleep(2)
+        await asyncio.sleep(4)
         alog("GREETING queued via LLMMessagesFrame")
         try:
             # Include system prompt — LLMMessagesFrame bypasses context aggregator
