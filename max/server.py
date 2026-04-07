@@ -662,24 +662,28 @@ async def join_meeting(request: Request):
 
     # MBaaS will connect to /ws/{bot_id} — we use "max" as the bot_id
     ws_url = f"wss://{domain}/ws/max"
+    # V2 API format — streaming only, NO recording, NO transcription
+    # This minimises token usage to ~0.10/hr (streaming only)
+    # vs 1.35/hr (recording + transcription + streaming)
     payload = {
         "bot_name":          bot_name,
         "meeting_url":       meeting_url,
-        "recording_mode":    "audio_only",
-        "streaming_enabled": True,
-        "streaming_config": {
-            "input_url":       ws_url,
-            "output_url":      ws_url,
-            "audio_frequency": SAMPLE_RATE,
+        "reserved":          False,
+        "streaming": {
+            "input":           ws_url,
+            "output":          ws_url,
+            "audio_frequency": "24khz",
         },
         "webhook_url":       f"https://{domain}/webhook",
         "extra":             {},
     }
+    # No recording_mode = no recording (saves 1.00 token/hr)
+    # No speech_to_text = no transcription (saves 0.25 token/hr)
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            f"{MEETING_BAAS_API}/bots",
+            "https://api.meetingbaas.com/bots",
             headers={
                 "x-meeting-baas-api-key": api_key,
                 "Content-Type":           "application/json",
