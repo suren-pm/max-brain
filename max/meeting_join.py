@@ -17,7 +17,7 @@ import httpx
 from loguru import logger
 
 
-MEETING_BAAS_API_URL = "https://api.meetingbaas.com"
+MEETING_BAAS_API_URL = "https://api.meetingbaas.com/v2"
 
 
 async def create_daily_room() -> dict:

@@ -14,7 +14,7 @@
 ## ✅ Active Stack (confirmed 01 Apr 2026)
 ```
 Google Meet
-  → Meeting BaaS (api.meetingbaas.com) — joins as bot
+  → Meeting BaaS (api.meetingbaas.com/v2) — joins as bot
   → WebSocket wss://max-brain-production.up.railway.app/ws/output/{bot_id}
   → Deepgram STT (nova-2-conversationalai, 16kHz PCM, 2.5s buffer)
   → Claude claude-3-5-haiku-20241022 (Railway brain, 5 tools)
