@@ -662,25 +662,26 @@ async def join_meeting(request: Request):
 
     # MBaaS will connect to /ws/{bot_id} — we use "max" as the bot_id
     ws_url = f"wss://{domain}/ws/max"
-    # V2 API — streaming only, NO recording, NO transcription
-    # Uses v1-style streaming_config fields (confirmed working) with v2 endpoint
+    # MBaaS API — nested streaming object (confirmed from reference speaking-bot repo)
     # No recording_mode = no recording (saves tokens)
     # No speech_to_text = no transcription (saves tokens)
     payload = {
-        "bot_name":          bot_name,
-        "meeting_url":       meeting_url,
-        "reserved":          False,
-        "streaming_input_url":      ws_url,
-        "streaming_output_url":     ws_url,
-        "streaming_audio_frequency": "24khz",
-        "webhook_url":       f"https://{domain}/webhook",
-        "extra":             {},
+        "bot_name":    bot_name,
+        "meeting_url": meeting_url,
+        "reserved":    False,
+        "streaming": {
+            "input":           ws_url,
+            "output":          ws_url,
+            "audio_frequency": "24khz",
+        },
+        "webhook_url": f"https://{domain}/webhook",
+        "extra":       {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            "https://api.meetingbaas.com/v2/bots",
+            "https://api.meetingbaas.com/bots",
             headers={
                 "x-meeting-baas-api-key": api_key,
                 "Content-Type":           "application/json",
