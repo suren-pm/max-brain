@@ -662,19 +662,18 @@ async def join_meeting(request: Request):
 
     # MBaaS will connect to /ws/{bot_id} — we use "max" as the bot_id
     ws_url = f"wss://{domain}/ws/max"
-    # MBaaS API — nested streaming object (confirmed from reference speaking-bot repo)
-    # No recording_mode = no recording (saves tokens)
-    # No speech_to_text = no transcription (saves tokens)
+    # MBaaS v2 API — requires streaming_enabled + streaming_config (NOT v1 nested "streaming")
+    # v2 field names: input_url, output_url, audio_frequency (number, not string)
     payload = {
         "bot_name":    bot_name,
         "meeting_url": meeting_url,
-        "reserved":    False,
-        "streaming": {
-            "input":           ws_url,
-            "output":          ws_url,
-            "audio_frequency": "16khz",
+        "recording_mode": "audio_only",
+        "streaming_enabled": True,
+        "streaming_config": {
+            "input_url":       ws_url,
+            "output_url":      ws_url,
+            "audio_frequency": SAMPLE_RATE,
         },
-        "webhook_url": f"https://{domain}/webhook",
         "extra":       {},
     }
 
