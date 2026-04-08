@@ -664,10 +664,12 @@ async def join_meeting(request: Request):
     ws_url = f"wss://{domain}/ws/max"
     # MBaaS v2 API — requires streaming_enabled + streaming_config (NOT v1 nested "streaming")
     # v2 field names: input_url, output_url, audio_frequency (number, not string)
+    # MBaaS v2 streaming-only — NO recording_mode (that activates recording +
+    # transcription services which bleed ~1.35 tokens/hr).  Streaming-only costs
+    # ~0.10 tokens/hr since we handle STT/TTS ourselves via Pipecat.
     payload = {
         "bot_name":    bot_name,
         "meeting_url": meeting_url,
-        "recording_mode": "audio_only",
         "streaming_enabled": True,
         "streaming_config": {
             "input_url":       ws_url,
