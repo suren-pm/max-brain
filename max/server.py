@@ -80,7 +80,7 @@ app.add_middleware(
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 MEETING_BAAS_API = "https://api.meetingbaas.com/v2"
-SAMPLE_RATE      = 24000
+SAMPLE_RATE      = 16000
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 pending_tasks:  list[dict] = []
@@ -672,7 +672,7 @@ async def join_meeting(request: Request):
         "streaming": {
             "input":           ws_url,
             "output":          ws_url,
-            "audio_frequency": "24khz",
+            "audio_frequency": "16khz",
         },
         "webhook_url": f"https://{domain}/webhook",
         "extra":       {},
