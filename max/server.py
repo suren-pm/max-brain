@@ -681,7 +681,7 @@ async def join_meeting(request: Request):
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            "https://api.meetingbaas.com/bots",
+            "https://api.meetingbaas.com/v2/bots",
             headers={
                 "x-meeting-baas-api-key": api_key,
                 "Content-Type":           "application/json",
