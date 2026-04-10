@@ -731,6 +731,16 @@ async def post_result(request: Request):
             break
     return {"ok": True, "result": result}
 
+@app.delete("/tasks/result/{ticket_id}")
+async def delete_result(ticket_id: str):
+    global test_results
+    before = len(test_results)
+    test_results = [r for r in test_results if r.get("ticket_id") != ticket_id]
+    removed = before - len(test_results)
+    if removed == 0:
+        return {"ok": False, "detail": f"No result found for {ticket_id}"}
+    return {"ok": True, "removed": removed, "ticket_id": ticket_id}
+
 @app.get("/tasks/results")
 async def get_results():
     return {
