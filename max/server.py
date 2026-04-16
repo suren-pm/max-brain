@@ -307,6 +307,9 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # TextFrames and drops them so TTS never sees them.
     class SilenceTextFilter(FrameProcessor):
         async def process_frame(self, frame, direction):
+            # CRITICAL: super() handles StartFrame registration and internal bookkeeping.
+            # Without this, the pipeline stalls (same bug that killed DiagLogger).
+            await super().process_frame(frame, direction)
             from pipecat.frames.frames import TextFrame
             if isinstance(frame, TextFrame) and hasattr(frame, 'text'):
                 cleaned = frame.text.strip().replace(' ', '')
