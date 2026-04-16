@@ -265,8 +265,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     """Inner pipeline function — separated so errors are always caught."""
     alog(f"PIPELINE init — importing pipecat modules...")
     try:
-        # VAD REMOVED — Silero VAD couldn't handle Google Meet background noise.
-        # Turn detection now handled by Deepgram endpointing (250ms).
+        from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
         # LLMMessagesFrame import removed — only used by disabled auto-greeting
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.runner import PipelineRunner
@@ -312,10 +311,9 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     alog(f"PIPECAT connecting to {pipecat_ws_url}")
 
     # ── Transport ──
-    # NO VAD — Silero VAD can't distinguish speech from Google Meet background
-    # noise, causing it to treat 2-second pauses as continuous speech.
-    # Instead, we rely on Deepgram's endpointing (250ms) for turn detection.
-    # Pipecat will "emulate" start/stop events from Deepgram transcripts.
+    # VAD restored — required for pipeline to function (no-VAD breaks audio flow).
+    # Using original working params. Turn timeout processor below compensates
+    # for VAD failing to detect silence in Google Meet audio.
     transport = WebsocketClientTransport(
         uri=pipecat_ws_url,
         params=WebsocketClientParams(
@@ -323,6 +321,15 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             audio_out_enabled=True,
             add_wav_header=False,
             audio_in_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(
+                sample_rate=16000,
+                params=VADParams(
+                    threshold=0.4,
+                    min_speech_duration_ms=200,
+                    min_silence_duration_ms=400,
+                    min_volume=0.2,
+                ),
+            ),
             serializer=ProtobufFrameSerializer(),
             timeout=3600,  # 1 hour — prevents pipeline from dying during meeting pauses
         ),
@@ -463,31 +470,84 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         sample_rate=SAMPLE_RATE,
     )
 
-    # DiagLogger REMOVED — it blocked all frames (StartFrame issue).
-    # Debug logging now via on_transcription / on_llm_response events below.
+    # ── Turn Timeout Processor ──
+    # Silero VAD can't detect silence in Google Meet audio (background noise
+    # keeps it above threshold). This processor acts as a safety net:
+    # if a transcription arrives but VAD doesn't fire UserStoppedSpeakingFrame
+    # within 1.5 seconds, we inject one to force the aggregator to finalize
+    # the turn and send it to Claude.
+    from pipecat.frames.frames import TranscriptionFrame, TextFrame, Frame
+    from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
+    # Import the frame we need to inject
+    try:
+        from pipecat.frames.frames import UserStoppedSpeakingFrame
+    except ImportError:
+        from pipecat.audio.vad.vad_analyzer import UserStoppedSpeakingFrame
+
+    class TurnTimeoutProcessor(FrameProcessor):
+        """Forces turn finalization when VAD fails to detect silence.
+
+        Passes ALL frames through unchanged (no blocking).
+        Adds a 1.5s timer after each transcription — if VAD hasn't fired
+        UserStoppedSpeakingFrame by then, we inject one ourselves.
+        """
+        def __init__(self, timeout_seconds=1.5, **kwargs):
+            super().__init__(**kwargs)
+            self._timeout = timeout_seconds
+            self._timer_task: asyncio.Task | None = None
+            self._has_pending = False
+
+        async def process_frame(self, frame: Frame, direction: FrameDirection):
+            # CRITICAL: pass every frame through immediately (including StartFrame)
+            await self.push_frame(frame, direction)
+
+            # Start/reset timer on new transcription
+            if isinstance(frame, TranscriptionFrame):
+                self._has_pending = True
+                if self._timer_task and not self._timer_task.done():
+                    self._timer_task.cancel()
+                self._timer_task = asyncio.create_task(self._force_turn_end())
+                alog(f"TURN TIMER: started ({self._timeout}s) for \"{frame.text}\"")
+
+            # VAD handled it — cancel our timer
+            elif isinstance(frame, UserStoppedSpeakingFrame):
+                self._has_pending = False
+                if self._timer_task and not self._timer_task.done():
+                    self._timer_task.cancel()
+                    self._timer_task = None
+                    alog("TURN TIMER: cancelled (VAD fired)")
+
+        async def _force_turn_end(self):
+            """Wait, then inject UserStoppedSpeakingFrame if VAD didn't."""
+            try:
+                await asyncio.sleep(self._timeout)
+                if self._has_pending:
+                    self._has_pending = False
+                    alog("TURN TIMER: FORCING turn end (VAD missed silence)")
+                    await self.push_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+            except asyncio.CancelledError:
+                pass
+
+    turn_timeout = TurnTimeoutProcessor(timeout_seconds=1.5)
 
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, tools)
     aggregator_pair = llm.create_context_aggregator(context)
 
-    # ── Event-based debug logging (safe — no custom FrameProcessor) ──
-    @stt.event_handler("on_transcription")
-    async def _on_stt(processor, frame):
-        if hasattr(frame, 'text') and frame.text:
-            alog(f"STT TRANSCRIPT: \"{frame.text}\"")
-
     # ── Pipeline ──
     pipeline = Pipeline([
         transport.input(),
         stt,
+        turn_timeout,              # Forces turn end if VAD misses silence
         aggregator_pair.user(),
         llm,
         tts,
         aggregator_pair.assistant(),
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→Claude→TTS→transport")
+    alog("PIPELINE built: transport→STT→TurnTimeout→Claude→TTS→transport")
 
     task = PipelineTask(
         pipeline,
