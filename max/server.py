@@ -94,6 +94,7 @@ pipecat_connections: dict[str, WebSocket] = {}  # bot_id → Pipecat WebSocket
 closing_clients: set[str] = set()
 active_pipelines: dict[str, dict] = {}
 audio_ready_events: dict[str, asyncio.Event] = {}  # signals when MBaaS audio is flowing
+last_real_audio_time: dict[str, float] = {}  # bot_id → timestamp of last real TTS audio sent to MBaaS
 
 # ── Diagnostic logging ────────────────────────────────────────────────────────
 diag_log: list[str] = []
@@ -291,6 +292,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         from pipecat.services.llm_service import FunctionCallParams
         from pipecat.adapters.schemas.function_schema import FunctionSchema
         from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        from pipecat.processors.frame_processor import FrameProcessor
         from max.persona import SYSTEM_PROMPT
         alog("PIPELINE imports OK")
     except ImportError as e:
@@ -298,6 +300,20 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         import traceback
         logger.error(traceback.format_exc())
         return
+
+    # ── Silence text filter: drops "..." responses before they hit TTS ──
+    # When the LLM decides Max should stay silent, it returns "..." which TTS
+    # renders as garbled audio ("dot dot dot").  This filter catches dot-only
+    # TextFrames and drops them so TTS never sees them.
+    class SilenceTextFilter(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            from pipecat.frames.frames import TextFrame
+            if isinstance(frame, TextFrame) and hasattr(frame, 'text'):
+                cleaned = frame.text.strip().replace(' ', '')
+                if cleaned and all(c in '.…·' for c in cleaned):
+                    # Pure dots/ellipsis — this is a silence indicator, drop it
+                    return
+            await self.push_frame(frame, direction)
 
     try:
         from pipecat.utils.asyncio import TaskManager
@@ -466,6 +482,9 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # DiagLogger REMOVED — it blocked all frames (StartFrame issue).
     # Debug logging now via on_transcription / on_llm_response events below.
 
+    # ── Silence filter instance ──
+    silence_filter = SilenceTextFilter()
+
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, tools)
@@ -483,11 +502,12 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         stt,
         aggregator_pair.user(),
         llm,
+        silence_filter,   # drops "..." before TTS sees it
         tts,
         aggregator_pair.assistant(),
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→Claude→TTS→transport")
+    alog("PIPELINE built: transport→STT→Claude→filter→TTS→transport")
 
     task = PipelineTask(
         pipeline,
@@ -527,26 +547,41 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     alog(f"WS/MBaaS connected: {bot_id}")
     audio_chunks_in = 0
 
-    # ── Startup silence burst: warms up Google Meet audio channel ──
-    # Send 5 seconds of silence at real-time rate when MBaaS first connects.
-    # This establishes the audio output channel so the first real response
-    # plays immediately. Stops BEFORE real audio flows to avoid interference.
-    async def _send_warmup_silence():
-        """Send a burst of silence to warm up Google Meet audio channel."""
+    # ── Smart continuous silence sender ──
+    # Keeps Google Meet audio channel warm AT ALL TIMES, but yields to real
+    # TTS audio to prevent interleaving/garbling.  Uses last_real_audio_time
+    # (updated by the /pipecat bridge when it forwards real TTS audio) to
+    # decide when silence is needed.
+    async def _send_continuous_silence():
+        """Keep Google Meet audio channel warm — pause when real TTS is playing."""
         silence_chunk = b'\x00' * 3200  # 100ms at 16kHz 16-bit mono
         try:
-            for i in range(50):  # 50 x 100ms = 5 seconds
+            # Phase 1: Initial burst (2s) — unconditional warmup
+            for i in range(20):
                 if bot_id in closing_clients:
-                    break
+                    return
                 await websocket.send_bytes(silence_chunk)
                 if i == 0:
-                    alog("WARMUP: sending 5s silence burst to MBaaS")
+                    alog("SILENCE: initial 2s warmup burst started")
                 await asyncio.sleep(0.1)
-            alog("WARMUP: silence burst complete — channel should be warm")
-        except Exception as e:
-            alog(f"WARMUP: error {e}")
+            alog("SILENCE: warmup done, entering smart gap-fill mode")
 
-    silence_task = asyncio.create_task(_send_warmup_silence())
+            # Phase 2: Continuous smart silence — only when no real audio recently
+            while bot_id not in closing_clients:
+                last_audio = last_real_audio_time.get(bot_id, 0)
+                gap = time.time() - last_audio
+                if gap > 0.25:
+                    # No real TTS audio in 250ms — send silence to keep channel warm
+                    try:
+                        await websocket.send_bytes(silence_chunk)
+                    except Exception:
+                        break
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            alog(f"SILENCE: error {e}")
+        alog("SILENCE: sender stopped")
+
+    silence_task = asyncio.create_task(_send_continuous_silence())
 
     # Start the Pipecat pipeline (connects to /pipecat/{bot_id})
     # Add done callback to surface any uncaught exceptions
@@ -606,6 +641,7 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
         closing_clients.add(bot_id)
         client_connections.pop(bot_id, None)
         audio_ready_events.pop(bot_id, None)
+        last_real_audio_time.pop(bot_id, None)
         silence_task.cancel()
         pipeline_task.cancel()
         try:
@@ -646,6 +682,8 @@ async def ws_pipecat(websocket: WebSocket, bot_id: str):
                     audio = protobuf_to_raw(msg["bytes"])
                     if audio:
                         audio_chunks_out += 1
+                        # Update timestamp so silence sender yields to real TTS
+                        last_real_audio_time[bot_id] = time.time()
                         if audio_chunks_out <= 3 or audio_chunks_out % 100 == 0:
                             alog(f"BRIDGE Pipecat→MBaaS: chunk #{audio_chunks_out} ({len(audio)} bytes)")
                         client_ws = client_connections.get(bot_id)
