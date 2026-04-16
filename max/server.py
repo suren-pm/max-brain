@@ -497,32 +497,9 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         ),
     )
 
-    # ── Greeting: wait for audio bridge to be ready, then greet ──
-    async def send_greeting():
-        evt = audio_ready_events.get(bot_id)
-        if evt:
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=15)
-                alog("GREETING: audio bridge confirmed ready")
-            except asyncio.TimeoutError:
-                alog("GREETING: timeout waiting for audio, greeting anyway")
-        # Extra buffer for MBaaS to fully establish bidirectional audio
-        await asyncio.sleep(4)
-        alog("GREETING queued via LLMMessagesFrame")
-        try:
-            # Include system prompt — LLMMessagesFrame bypasses context aggregator
-            await task.queue_frame(LLMMessagesFrame([
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": "You just joined the meeting. Say ONLY two words: 'Max here.' Nothing else."},
-            ]))
-            alog("GREETING frame queued OK")
-        except Exception as e:
-            alog(f"GREETING ERROR: {e}")
-
-    # RE-ENABLED: brief greeting serves as pipeline warmup.
-    # Without it, the first user interaction gets stuck (STT/VAD not calibrated).
-    # After greeting, all subsequent interactions work instantly.
-    asyncio.create_task(send_greeting())
+    # Greeting REMOVED — it doesn't help with first-utterance detection.
+    # The continuous silence sender in ws_meetingbaas keeps the Google Meet
+    # audio channel warm instead. Max joins silently and responds when spoken to.
 
     # ── Run ──
     runner = PipelineRunner()
@@ -549,6 +526,32 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     audio_ready_events[bot_id] = asyncio.Event()
     alog(f"WS/MBaaS connected: {bot_id}")
     audio_chunks_in = 0
+
+    # ── Continuous silence sender: keeps Google Meet audio channel HOT ──
+    # Without this, Meet buffers/drops the first few seconds of bot audio
+    # after a silence gap, causing the first response to be "swallowed".
+    _silence_active = True
+    _silence_chunk = b'\x00' * 3200  # 100ms of silence at 16kHz 16-bit mono
+
+    async def _send_continuous_silence():
+        """Send real-time silence to MBaaS to keep the audio output warm."""
+        nonlocal _silence_active
+        warmup_count = 0
+        try:
+            while _silence_active and bot_id not in closing_clients:
+                try:
+                    await websocket.send_bytes(_silence_chunk)
+                    warmup_count += 1
+                    if warmup_count <= 3 or warmup_count % 500 == 0:
+                        alog(f"SILENCE SENDER: chunk #{warmup_count}")
+                    await asyncio.sleep(0.1)  # 100ms = real-time for 3200-byte chunks
+                except Exception:
+                    break
+        except Exception:
+            pass
+        alog(f"SILENCE SENDER: stopped after {warmup_count} chunks")
+
+    silence_task = asyncio.create_task(_send_continuous_silence())
 
     # Start the Pipecat pipeline (connects to /pipecat/{bot_id})
     # Add done callback to surface any uncaught exceptions
@@ -605,10 +608,16 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     except Exception as e:
         alog(f"WS/MBaaS error: {e}")
     finally:
+        _silence_active = False
         closing_clients.add(bot_id)
         client_connections.pop(bot_id, None)
         audio_ready_events.pop(bot_id, None)
+        silence_task.cancel()
         pipeline_task.cancel()
+        try:
+            await silence_task
+        except (asyncio.CancelledError, Exception):
+            pass
         try:
             await pipeline_task
         except (asyncio.CancelledError, Exception):
