@@ -470,84 +470,49 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         sample_rate=SAMPLE_RATE,
     )
 
-    # ── Turn Timeout Processor ──
-    # Silero VAD can't detect silence in Google Meet audio (background noise
-    # keeps it above threshold). This processor acts as a safety net:
-    # if a transcription arrives but VAD doesn't fire UserStoppedSpeakingFrame
-    # within 1.5 seconds, we inject one to force the aggregator to finalize
-    # the turn and send it to Claude.
-    from pipecat.frames.frames import TranscriptionFrame, TextFrame, Frame
-    from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-
-    # Import the frame we need to inject
+    # ── Turn Timeout (outside pipeline — avoids FrameProcessor StartFrame issue) ──
+    # Pipecat's FrameProcessor._check_started blocks ALL frames before StartFrame,
+    # making custom processors unusable. Instead, we monkey-patch STT output and
+    # use task.queue_frame() to inject UserStoppedSpeakingFrame from outside.
+    from pipecat.frames.frames import TranscriptionFrame, TextFrame
     try:
         from pipecat.frames.frames import UserStoppedSpeakingFrame
     except ImportError:
         from pipecat.audio.vad.vad_analyzer import UserStoppedSpeakingFrame
 
-    class TurnTimeoutProcessor(FrameProcessor):
-        """Forces turn finalization when VAD fails to detect silence.
+    _last_transcript_time = [0.0]  # mutable container for closure
+    _turn_timer_task = [None]
 
-        Passes ALL frames through unchanged (no blocking).
-        Adds a 1.5s timer after each transcription — if VAD hasn't fired
-        UserStoppedSpeakingFrame by then, we inject one ourselves.
-        """
-        def __init__(self, timeout_seconds=1.5, **kwargs):
-            super().__init__(**kwargs)
-            self._timeout = timeout_seconds
-            self._timer_task: asyncio.Task | None = None
-            self._has_pending = False
+    _original_stt_push = stt.push_frame
 
-        async def process_frame(self, frame: Frame, direction: FrameDirection):
-            # CRITICAL: pass every frame through immediately (including StartFrame)
-            await self.push_frame(frame, direction)
+    async def _patched_stt_push(frame, direction=None):
+        """Intercept STT output to track transcript timing."""
+        if isinstance(frame, TranscriptionFrame) and frame.text:
+            _last_transcript_time[0] = time.time()
+            alog(f"STT TRANSCRIPT: \"{frame.text}\"")
+        if direction is not None:
+            await _original_stt_push(frame, direction)
+        else:
+            await _original_stt_push(frame)
 
-            # Start/reset timer on new transcription
-            if isinstance(frame, TranscriptionFrame):
-                self._has_pending = True
-                if self._timer_task and not self._timer_task.done():
-                    self._timer_task.cancel()
-                self._timer_task = asyncio.create_task(self._force_turn_end())
-                alog(f"TURN TIMER: started ({self._timeout}s) for \"{frame.text}\"")
-
-            # VAD handled it — cancel our timer
-            elif isinstance(frame, UserStoppedSpeakingFrame):
-                self._has_pending = False
-                if self._timer_task and not self._timer_task.done():
-                    self._timer_task.cancel()
-                    self._timer_task = None
-                    alog("TURN TIMER: cancelled (VAD fired)")
-
-        async def _force_turn_end(self):
-            """Wait, then inject UserStoppedSpeakingFrame if VAD didn't."""
-            try:
-                await asyncio.sleep(self._timeout)
-                if self._has_pending:
-                    self._has_pending = False
-                    alog("TURN TIMER: FORCING turn end (VAD missed silence)")
-                    await self.push_frame(UserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-            except asyncio.CancelledError:
-                pass
-
-    turn_timeout = TurnTimeoutProcessor(timeout_seconds=1.5)
+    stt.push_frame = _patched_stt_push
 
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, tools)
     aggregator_pair = llm.create_context_aggregator(context)
 
-    # ── Pipeline ──
+    # ── Pipeline (clean — no custom processors) ──
     pipeline = Pipeline([
         transport.input(),
         stt,
-        turn_timeout,              # Forces turn end if VAD misses silence
         aggregator_pair.user(),
         llm,
         tts,
         aggregator_pair.assistant(),
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→TurnTimeout→Claude→TTS→transport")
+    alog("PIPELINE built: transport→STT→Claude→TTS→transport")
 
     task = PipelineTask(
         pipeline,
@@ -581,6 +546,24 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
 
     # asyncio.create_task(send_greeting())  # DISABLED: greeting interrupts ongoing conversations
     # Max now responds only when his name is said (e.g. "Hey Max")
+
+    # ── Turn Timeout Monitor ──
+    # Background task: if STT sent a transcript but VAD hasn't ended the turn
+    # within 1.5s (Google Meet noise keeps VAD active), force a turn end.
+    async def turn_timeout_monitor():
+        TIMEOUT = 1.5
+        while True:
+            await asyncio.sleep(0.3)  # Check every 300ms
+            t = _last_transcript_time[0]
+            if t > 0 and (time.time() - t) > TIMEOUT:
+                _last_transcript_time[0] = 0.0  # Reset so we don't fire again
+                try:
+                    alog("TURN TIMEOUT: forcing turn end (VAD missed silence)")
+                    await task.queue_frame(UserStoppedSpeakingFrame())
+                except Exception as e:
+                    alog(f"TURN TIMEOUT ERROR: {e}")
+
+    asyncio.create_task(turn_timeout_monitor())
 
     # ── Run ──
     runner = PipelineRunner()
