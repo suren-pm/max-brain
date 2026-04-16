@@ -323,7 +323,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
                 params=VADParams(
                     threshold=0.3,          # lowered: catch short phrases like "Hey Max"
                     min_speech_duration_ms=100, # lowered: 100ms catches 2-word greetings
-                    min_silence_duration_ms=500, # slightly longer: give STT time to finish
+                    min_silence_duration_ms=300,  # 300ms: fast enough to feel responsive
                     min_volume=0.1,             # lowered: catch quieter casual speech
                 ),
             ),
@@ -484,7 +484,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
+            allow_interruptions=False,  # disabled: prevents echo feedback breaking Max's voice
             check_dangling_tasks=True,
         ),
     )
