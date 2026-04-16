@@ -328,7 +328,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
                 ),
             ),
             serializer=ProtobufFrameSerializer(),
-            timeout=300,
+            timeout=3600,  # 1 hour — prevents pipeline from dying during meeting pauses
         ),
     )
 
