@@ -265,7 +265,8 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     """Inner pipeline function — separated so errors are always caught."""
     alog(f"PIPELINE init — importing pipecat modules...")
     try:
-        from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
+        # VAD REMOVED — Silero VAD couldn't handle Google Meet background noise.
+        # Turn detection now handled by Deepgram endpointing (250ms).
         # LLMMessagesFrame import removed — only used by disabled auto-greeting
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.runner import PipelineRunner
@@ -311,6 +312,10 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     alog(f"PIPECAT connecting to {pipecat_ws_url}")
 
     # ── Transport ──
+    # NO VAD — Silero VAD can't distinguish speech from Google Meet background
+    # noise, causing it to treat 2-second pauses as continuous speech.
+    # Instead, we rely on Deepgram's endpointing (250ms) for turn detection.
+    # Pipecat will "emulate" start/stop events from Deepgram transcripts.
     transport = WebsocketClientTransport(
         uri=pipecat_ws_url,
         params=WebsocketClientParams(
@@ -318,15 +323,6 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             audio_out_enabled=True,
             add_wav_header=False,
             audio_in_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(
-                sample_rate=16000,
-                params=VADParams(
-                    threshold=0.6,             # was 0.4 — too sensitive for Google Meet background noise
-                    min_speech_duration_ms=200,
-                    min_silence_duration_ms=600, # was 400 — give slightly more buffer for turn detection
-                    min_volume=0.4,             # was 0.2 — filter out Google Meet comfort noise
-                ),
-            ),
             serializer=ProtobufFrameSerializer(),
             timeout=3600,  # 1 hour — prevents pipeline from dying during meeting pauses
         ),
