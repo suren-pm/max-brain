@@ -266,7 +266,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     alog(f"PIPELINE init — importing pipecat modules...")
     try:
         from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
-        from pipecat.frames.frames import LLMMessagesFrame
+        # LLMMessagesFrame import removed — only used by disabled auto-greeting
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.runner import PipelineRunner
         from pipecat.pipeline.task import PipelineParams, PipelineTask
