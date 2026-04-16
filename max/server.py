@@ -311,9 +311,6 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     alog(f"PIPECAT connecting to {pipecat_ws_url}")
 
     # ── Transport ──
-    # VAD restored — required for pipeline to function (no-VAD breaks audio flow).
-    # Using original working params. Turn timeout processor below compensates
-    # for VAD failing to detect silence in Google Meet audio.
     transport = WebsocketClientTransport(
         uri=pipecat_ws_url,
         params=WebsocketClientParams(
@@ -336,15 +333,11 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     )
 
     # ── STT: Deepgram streaming WebSocket ──
-    # endpointing=250 → Deepgram finalizes transcription after 250ms silence
-    # (default ~1000ms holds short phrases like "Hey Max" too long,
-    #  causing them to batch with the next utterance)
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         encoding="linear16",
         sample_rate=SAMPLE_RATE,
         language="en",
-        endpointing=250,
     )
 
     # ── LLM: Claude ──
@@ -470,39 +463,21 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         sample_rate=SAMPLE_RATE,
     )
 
-    # ── Turn Timeout (outside pipeline — avoids FrameProcessor StartFrame issue) ──
-    # Pipecat's FrameProcessor._check_started blocks ALL frames before StartFrame,
-    # making custom processors unusable. Instead, we monkey-patch STT output and
-    # use task.queue_frame() to inject UserStoppedSpeakingFrame from outside.
-    from pipecat.frames.frames import TranscriptionFrame, TextFrame
-    try:
-        from pipecat.frames.frames import UserStoppedSpeakingFrame
-    except ImportError:
-        from pipecat.audio.vad.vad_analyzer import UserStoppedSpeakingFrame
-
-    _last_transcript_time = [0.0]  # mutable container for closure
-    _turn_timer_task = [None]
-
-    _original_stt_push = stt.push_frame
-
-    async def _patched_stt_push(frame, direction=None):
-        """Intercept STT output to track transcript timing."""
-        if isinstance(frame, TranscriptionFrame) and frame.text:
-            _last_transcript_time[0] = time.time()
-            alog(f"STT TRANSCRIPT: \"{frame.text}\"")
-        if direction is not None:
-            await _original_stt_push(frame, direction)
-        else:
-            await _original_stt_push(frame)
-
-    stt.push_frame = _patched_stt_push
+    # DiagLogger REMOVED — it blocked all frames (StartFrame issue).
+    # Debug logging now via on_transcription / on_llm_response events below.
 
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, tools)
     aggregator_pair = llm.create_context_aggregator(context)
 
-    # ── Pipeline (clean — no custom processors) ──
+    # ── Event-based debug logging (safe — no custom FrameProcessor) ──
+    @stt.event_handler("on_transcription")
+    async def _on_stt(processor, frame):
+        if hasattr(frame, 'text') and frame.text:
+            alog(f"STT TRANSCRIPT: \"{frame.text}\"")
+
+    # ── Pipeline ──
     pipeline = Pipeline([
         transport.input(),
         stt,
@@ -546,24 +521,6 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
 
     # asyncio.create_task(send_greeting())  # DISABLED: greeting interrupts ongoing conversations
     # Max now responds only when his name is said (e.g. "Hey Max")
-
-    # ── Turn Timeout Monitor ──
-    # Background task: if STT sent a transcript but VAD hasn't ended the turn
-    # within 1.5s (Google Meet noise keeps VAD active), force a turn end.
-    async def turn_timeout_monitor():
-        TIMEOUT = 1.5
-        while True:
-            await asyncio.sleep(0.3)  # Check every 300ms
-            t = _last_transcript_time[0]
-            if t > 0 and (time.time() - t) > TIMEOUT:
-                _last_transcript_time[0] = 0.0  # Reset so we don't fire again
-                try:
-                    alog("TURN TIMEOUT: forcing turn end (VAD missed silence)")
-                    await task.queue_frame(UserStoppedSpeakingFrame())
-                except Exception as e:
-                    alog(f"TURN TIMEOUT ERROR: {e}")
-
-    asyncio.create_task(turn_timeout_monitor())
 
     # ── Run ──
     runner = PipelineRunner()
