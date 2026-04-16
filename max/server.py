@@ -321,10 +321,10 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=16000,
                 params=VADParams(
-                    threshold=0.4,
-                    min_speech_duration_ms=200,
-                    min_silence_duration_ms=400,
-                    min_volume=0.2,
+                    threshold=0.3,          # lowered: catch short phrases like "Hey Max"
+                    min_speech_duration_ms=100, # lowered: 100ms catches 2-word greetings
+                    min_silence_duration_ms=500, # slightly longer: give STT time to finish
+                    min_volume=0.1,             # lowered: catch quieter casual speech
                 ),
             ),
             serializer=ProtobufFrameSerializer(),
@@ -335,6 +335,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # ── STT: Deepgram streaming WebSocket ──
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
+        model="nova-2",            # nova-2: significantly better accuracy on short phrases
         encoding="linear16",
         sample_rate=SAMPLE_RATE,
         language="en",
@@ -459,7 +460,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # ── TTS: Deepgram streaming WebSocket ──
     tts = DeepgramTTSService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
-        voice="aura-arcas-en",
+        voice="aura-2-thalia-en",  # lower latency streaming, smoother audio delivery
         sample_rate=SAMPLE_RATE,
     )
 
