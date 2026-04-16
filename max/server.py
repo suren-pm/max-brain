@@ -266,7 +266,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     alog(f"PIPELINE init — importing pipecat modules...")
     try:
         from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
-        # LLMMessagesFrame import removed — only used by disabled auto-greeting
+        from pipecat.frames.frames import LLMMessagesFrame
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.runner import PipelineRunner
         from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -513,14 +513,16 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             # Include system prompt — LLMMessagesFrame bypasses context aggregator
             await task.queue_frame(LLMMessagesFrame([
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": "You just joined the standup meeting. Introduce yourself briefly with energy!"},
+                {"role": "user", "content": "You just joined the meeting. Say ONLY two words: 'Max here.' Nothing else."},
             ]))
             alog("GREETING frame queued OK")
         except Exception as e:
             alog(f"GREETING ERROR: {e}")
 
-    # asyncio.create_task(send_greeting())  # DISABLED: greeting interrupts ongoing conversations
-    # Max now responds only when his name is said (e.g. "Hey Max")
+    # RE-ENABLED: brief greeting serves as pipeline warmup.
+    # Without it, the first user interaction gets stuck (STT/VAD not calibrated).
+    # After greeting, all subsequent interactions work instantly.
+    asyncio.create_task(send_greeting())
 
     # ── Run ──
     runner = PipelineRunner()
