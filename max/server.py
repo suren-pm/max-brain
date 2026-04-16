@@ -321,10 +321,10 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=16000,
                 params=VADParams(
-                    threshold=0.4,
+                    threshold=0.6,             # was 0.4 — too sensitive for Google Meet background noise
                     min_speech_duration_ms=200,
-                    min_silence_duration_ms=400,
-                    min_volume=0.2,
+                    min_silence_duration_ms=600, # was 400 — give slightly more buffer for turn detection
+                    min_volume=0.4,             # was 0.2 — filter out Google Meet comfort noise
                 ),
             ),
             serializer=ProtobufFrameSerializer(),
