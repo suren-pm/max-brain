@@ -65,7 +65,7 @@ def _log_sink(message):
         ts = time.strftime('%H:%M:%S')
         entry = f"{ts} [PC] {text[-200:]}"
         _pipecat_logs.append(entry)
-        if len(_pipecat_logs) > 50:
+        if len(_pipecat_logs) > 200:
             _pipecat_logs.pop(0)
 
 logger.add(_log_sink, level="DEBUG")
@@ -102,7 +102,7 @@ def alog(msg: str) -> None:
     ts = time.strftime('%H:%M:%S')
     entry = f"{ts} {msg}"
     diag_log.append(entry)
-    if len(diag_log) > 100:
+    if len(diag_log) > 200:
         diag_log.pop(0)
     logger.info(msg)
 
@@ -472,13 +472,34 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     pipeline = Pipeline([
         transport.input(),
         stt,
+        diag,
         aggregator_pair.user(),
         llm,
         tts,
         aggregator_pair.assistant(),
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→Claude→TTS→transport")
+    # ── Diagnostic interceptors ──
+    # Log every STT transcript and LLM response for debugging
+    from pipecat.frames.frames import TranscriptionFrame, TextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+    class DiagLogger(FrameProcessor):
+        """Logs key frames passing through the pipeline for debugging."""
+        async def process_frame(self, frame, direction):
+            if isinstance(frame, TranscriptionFrame):
+                alog(f"STT TRANSCRIPT: \"{frame.text}\" (user={getattr(frame, 'user_id', '?')})")
+            elif isinstance(frame, TextFrame):
+                text = frame.text.strip()
+                if text and text != "...":
+                    alog(f"LLM TEXT: \"{text[:100]}\"")
+                elif text == "...":
+                    alog(f"LLM SILENT: Claude returned \"...\" (chose not to speak)")
+            await self.push_frame(frame, direction)
+
+    diag = DiagLogger()
+
+    alog("PIPELINE built: transport→STT→diag→Claude→TTS→transport")
 
     task = PipelineTask(
         pipeline,
