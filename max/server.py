@@ -321,10 +321,10 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=16000,
                 params=VADParams(
-                    threshold=0.4,
-                    min_speech_duration_ms=200,
-                    min_silence_duration_ms=400,
-                    min_volume=0.2,
+                    confidence=0.5,   # Lower than default 0.7 for reliable first-utterance detection
+                    start_secs=0.2,   # Duration of speech needed to confirm start
+                    stop_secs=0.8,    # Duration of silence needed to confirm stop
+                    min_volume=0.2,   # Low threshold for meeting audio
                 ),
             ),
             serializer=ProtobufFrameSerializer(),
