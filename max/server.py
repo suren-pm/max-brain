@@ -463,41 +463,31 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         sample_rate=SAMPLE_RATE,
     )
 
-    # ── Diagnostic interceptor ──
-    from pipecat.frames.frames import TranscriptionFrame, TextFrame
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-
-    class DiagLogger(FrameProcessor):
-        async def process_frame(self, frame, direction):
-            if isinstance(frame, TranscriptionFrame):
-                alog(f"STT TRANSCRIPT: \"{frame.text}\"")
-            elif isinstance(frame, TextFrame):
-                text = frame.text.strip()
-                if text == "...":
-                    alog(f"LLM SILENT: Claude returned '...'")
-                elif text:
-                    alog(f"LLM TEXT: \"{text[:80]}\"")
-            await self.push_frame(frame, direction)
-
-    diag = DiagLogger()
+    # DiagLogger REMOVED — it blocked all frames (StartFrame issue).
+    # Debug logging now via on_transcription / on_llm_response events below.
 
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, tools)
     aggregator_pair = llm.create_context_aggregator(context)
 
+    # ── Event-based debug logging (safe — no custom FrameProcessor) ──
+    @stt.event_handler("on_transcription")
+    async def _on_stt(processor, frame):
+        if hasattr(frame, 'text') and frame.text:
+            alog(f"STT TRANSCRIPT: \"{frame.text}\"")
+
     # ── Pipeline ──
     pipeline = Pipeline([
         transport.input(),
         stt,
-        diag,
         aggregator_pair.user(),
         llm,
         tts,
         aggregator_pair.assistant(),
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→diag→Claude→TTS→transport")
+    alog("PIPELINE built: transport→STT→Claude→TTS→transport")
 
     task = PipelineTask(
         pipeline,
