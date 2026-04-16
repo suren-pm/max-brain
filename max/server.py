@@ -333,11 +333,15 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     )
 
     # ── STT: Deepgram streaming WebSocket ──
+    # endpointing=250 → Deepgram finalizes transcription after 250ms silence
+    # (default ~1000ms holds short phrases like "Hey Max" too long,
+    #  causing them to batch with the next utterance)
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         encoding="linear16",
         sample_rate=SAMPLE_RATE,
         language="en",
+        endpointing=250,
     )
 
     # ── LLM: Claude ──
