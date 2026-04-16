@@ -527,31 +527,26 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     alog(f"WS/MBaaS connected: {bot_id}")
     audio_chunks_in = 0
 
-    # ── Continuous silence sender: keeps Google Meet audio channel HOT ──
-    # Without this, Meet buffers/drops the first few seconds of bot audio
-    # after a silence gap, causing the first response to be "swallowed".
-    _silence_active = True
-    _silence_chunk = b'\x00' * 3200  # 100ms of silence at 16kHz 16-bit mono
-
-    async def _send_continuous_silence():
-        """Send real-time silence to MBaaS to keep the audio output warm."""
-        nonlocal _silence_active
-        warmup_count = 0
+    # ── Startup silence burst: warms up Google Meet audio channel ──
+    # Send 5 seconds of silence at real-time rate when MBaaS first connects.
+    # This establishes the audio output channel so the first real response
+    # plays immediately. Stops BEFORE real audio flows to avoid interference.
+    async def _send_warmup_silence():
+        """Send a burst of silence to warm up Google Meet audio channel."""
+        silence_chunk = b'\x00' * 3200  # 100ms at 16kHz 16-bit mono
         try:
-            while _silence_active and bot_id not in closing_clients:
-                try:
-                    await websocket.send_bytes(_silence_chunk)
-                    warmup_count += 1
-                    if warmup_count <= 3 or warmup_count % 500 == 0:
-                        alog(f"SILENCE SENDER: chunk #{warmup_count}")
-                    await asyncio.sleep(0.1)  # 100ms = real-time for 3200-byte chunks
-                except Exception:
+            for i in range(50):  # 50 x 100ms = 5 seconds
+                if bot_id in closing_clients:
                     break
-        except Exception:
-            pass
-        alog(f"SILENCE SENDER: stopped after {warmup_count} chunks")
+                await websocket.send_bytes(silence_chunk)
+                if i == 0:
+                    alog("WARMUP: sending 5s silence burst to MBaaS")
+                await asyncio.sleep(0.1)
+            alog("WARMUP: silence burst complete — channel should be warm")
+        except Exception as e:
+            alog(f"WARMUP: error {e}")
 
-    silence_task = asyncio.create_task(_send_continuous_silence())
+    silence_task = asyncio.create_task(_send_warmup_silence())
 
     # Start the Pipecat pipeline (connects to /pipecat/{bot_id})
     # Add done callback to surface any uncaught exceptions
@@ -608,7 +603,6 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
     except Exception as e:
         alog(f"WS/MBaaS error: {e}")
     finally:
-        _silence_active = False
         closing_clients.add(bot_id)
         client_connections.pop(bot_id, None)
         audio_ready_events.pop(bot_id, None)
