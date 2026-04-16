@@ -463,6 +463,24 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         sample_rate=SAMPLE_RATE,
     )
 
+    # ── Diagnostic interceptor ──
+    from pipecat.frames.frames import TranscriptionFrame, TextFrame
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+    class DiagLogger(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            if isinstance(frame, TranscriptionFrame):
+                alog(f"STT TRANSCRIPT: \"{frame.text}\"")
+            elif isinstance(frame, TextFrame):
+                text = frame.text.strip()
+                if text == "...":
+                    alog(f"LLM SILENT: Claude returned '...'")
+                elif text:
+                    alog(f"LLM TEXT: \"{text[:80]}\"")
+            await self.push_frame(frame, direction)
+
+    diag = DiagLogger()
+
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context = OpenAILLMContext(messages, tools)
@@ -479,26 +497,6 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         aggregator_pair.assistant(),
         transport.output(),
     ])
-    # ── Diagnostic interceptors ──
-    # Log every STT transcript and LLM response for debugging
-    from pipecat.frames.frames import TranscriptionFrame, TextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-
-    class DiagLogger(FrameProcessor):
-        """Logs key frames passing through the pipeline for debugging."""
-        async def process_frame(self, frame, direction):
-            if isinstance(frame, TranscriptionFrame):
-                alog(f"STT TRANSCRIPT: \"{frame.text}\" (user={getattr(frame, 'user_id', '?')})")
-            elif isinstance(frame, TextFrame):
-                text = frame.text.strip()
-                if text and text != "...":
-                    alog(f"LLM TEXT: \"{text[:100]}\"")
-                elif text == "...":
-                    alog(f"LLM SILENT: Claude returned \"...\" (chose not to speak)")
-            await self.push_frame(frame, direction)
-
-    diag = DiagLogger()
-
     alog("PIPELINE built: transport→STT→diag→Claude→TTS→transport")
 
     task = PipelineTask(
