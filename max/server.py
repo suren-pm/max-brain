@@ -460,7 +460,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # ── TTS: Deepgram streaming WebSocket ──
     tts = DeepgramTTSService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
-        voice="aura-2-thalia-en",  # lower latency streaming, smoother audio delivery
+        voice="aura-arcas-en",
         sample_rate=SAMPLE_RATE,
     )
 
