@@ -2,7 +2,7 @@
 # Stack: Meeting BaaS → Pipecat (Streaming STT → Claude → Streaming TTS) → Meeting BaaS
 
 # Pipecat framework with required service integrations
-pipecat-ai[anthropic,deepgram,silero,websocket]>=0.0.69
+pipecat-ai[anthropic,deepgram,silero,websocket]==0.0.108
 
 # Web framework
 fastapi>=0.115.0
