@@ -342,7 +342,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
                 params=VADParams(
                     confidence=0.5,   # Lower than default 0.7 for reliable first-utterance detection
                     start_secs=0.2,   # Duration of speech needed to confirm start
-                    stop_secs=0.8,    # Duration of silence needed to confirm stop
+                    stop_secs=0.4,    # Reduced from 0.8 — faster response, ~400ms saved per turn
                     min_volume=0.2,   # Low threshold for meeting audio
                 ),
             ),
