@@ -367,16 +367,26 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         await params.result_callback(json.dumps({"ok": True, "task": task}))
 
     async def tool_get_test_results(params: FunctionCallParams):
+        import datetime
+        # Only return yesterday's results — standup is in the morning, tests ran yesterday afternoon
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday_results = [r for r in test_results if r.get("posted_at", "").startswith(yesterday)]
         await params.result_callback(json.dumps({
-            "results": test_results[-10:],
+            "results": yesterday_results,
             "pending": [t for t in pending_tasks if t.get("status") == "pending"],
+            "date": yesterday,
         }))
 
     async def tool_get_standup_briefing(params: FunctionCallParams):
+        import datetime
+        # Only return yesterday's completed tests for standup update
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday_results = [r for r in test_results if r.get("posted_at", "").startswith(yesterday)]
         await params.result_callback(json.dumps({
             "briefing":        briefing_cache or "No briefing available.",
-            "completed_tests": [r for r in test_results if r][-5:],
+            "completed_tests": yesterday_results[-5:],
             "pending_tasks":   [t for t in pending_tasks if t.get("status") == "pending"],
+            "date": yesterday,
         }))
 
     async def tool_save_standup_note(params: FunctionCallParams):
@@ -500,7 +510,8 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         except Exception as e:
             alog(f"GREETING ERROR: {e}")
 
-    asyncio.create_task(send_greeting())
+    # asyncio.create_task(send_greeting())  # DISABLED: greeting interrupts ongoing conversations
+    # Max now responds only when his name is said (e.g. "Hey Max")
 
     # ── Run ──
     runner = PipelineRunner()
