@@ -96,6 +96,11 @@ active_pipelines: dict[str, dict] = {}
 audio_ready_events: dict[str, asyncio.Event] = {}  # signals when MBaaS audio is flowing
 last_real_audio_time: dict[str, float] = {}  # bot_id → timestamp of last real TTS audio sent to MBaaS
 
+# ── Instrumentation (see docs/superpowers/specs/2026-04-24-max-latency-instrumentation-design.md)
+from max.timings import TimingBuffer
+timings: TimingBuffer = TimingBuffer()           # singleton — one Max at a time
+last_transcript: dict[str, str] = {}             # bot_id → latest finalized STT transcript
+
 # ── Diagnostic logging ────────────────────────────────────────────────────────
 diag_log: list[str] = []
 
@@ -365,6 +370,20 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         model="claude-haiku-4-5-20251001",
     )
 
+    # ── Tool timing wrapper ──
+    # Wraps each registered tool function to record its duration into the
+    # active timing turn.  If no turn is open when the tool fires, record_tool
+    # is a no-op — so this is safe in all pipeline states.
+    def _timed(name: str, fn):
+        async def _wrapper(params):
+            t0 = time.monotonic()
+            try:
+                return await fn(params)
+            finally:
+                timings.record_tool(name, (time.monotonic() - t0) * 1000.0)
+        _wrapper.__name__ = fn.__name__
+        return _wrapper
+
     # ── Register tool functions ──
     async def tool_get_jira_ticket(params: FunctionCallParams):
         result = await jira_get_ticket(params.arguments.get("ticket_id", ""))
@@ -419,12 +438,12 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         alog(f"NOTE saved: {note['speaker']} — {note['summary'][:60]}")
         await params.result_callback(json.dumps({"ok": True, "note": note, "total_notes": len(standup_notes)}))
 
-    llm.register_function("get_jira_ticket", tool_get_jira_ticket)
-    llm.register_function("get_testing_tickets", tool_get_testing_tickets)
-    llm.register_function("log_task", tool_log_task)
-    llm.register_function("get_test_results", tool_get_test_results)
-    llm.register_function("get_standup_briefing", tool_get_standup_briefing)
-    llm.register_function("save_standup_note", tool_save_standup_note)
+    llm.register_function("get_jira_ticket",      _timed("get_jira_ticket",      tool_get_jira_ticket))
+    llm.register_function("get_testing_tickets",  _timed("get_testing_tickets",  tool_get_testing_tickets))
+    llm.register_function("log_task",             _timed("log_task",             tool_log_task))
+    llm.register_function("get_test_results",     _timed("get_test_results",     tool_get_test_results))
+    llm.register_function("get_standup_briefing", _timed("get_standup_briefing", tool_get_standup_briefing))
+    llm.register_function("save_standup_note",    _timed("save_standup_note",    tool_save_standup_note))
 
     # ── Tool schemas ──
     tools = ToolsSchema(standard_tools=[
