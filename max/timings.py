@@ -59,11 +59,17 @@ class TimingBuffer:
         self._tool_calls: list[dict] = []
 
     def open_turn(self) -> int:
-        """Start a new turn.  Closes any orphaned previous turn first.
+        """Start a new turn.  Finalizes any prior turn as incomplete.
+
+        A fresh UserStoppedSpeakingFrame means the user has moved on — the
+        previous turn is definitionally over, whether or not Max responded.
+        (Max may have stayed silent; the LLM may have returned "..." which
+        SilenceTextFilter dropped; etc.)  Always finalize the prior turn
+        so it's visible in /debug/timings rather than silently lost.
 
         Returns the new turn_id.
         """
-        self._maybe_close_orphan()
+        self._close_current_as_incomplete()
         self._next_id += 1
         self.current = {
             "turn_id": self._next_id,
@@ -118,10 +124,22 @@ class TimingBuffer:
     # ── internals ────────────────────────────────────────────────────────────
 
     def _maybe_close_orphan(self) -> None:
+        """Close the current turn if it's been open longer than
+        orphan_timeout_s.  Used from snapshot() so an in-flight turn
+        (user spoke but Max is still thinking) isn't prematurely closed."""
         if self.current is None:
             return
         age = self._clock() - self.current.get("T_speech_end", self._clock())
         if age < self._orphan_timeout_s:
+            return
+        self._close_current_as_incomplete()
+
+    def _close_current_as_incomplete(self) -> None:
+        """Force-close the current turn as incomplete.  Called from
+        open_turn — at that moment, a new user utterance has ended, so
+        the previous turn is over regardless of whether it got its own
+        TTS response."""
+        if self.current is None:
             return
         self.current["tool_calls"] = list(self._tool_calls)
         self._finalize(self.current, incomplete=True)

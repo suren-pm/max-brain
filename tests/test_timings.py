@@ -47,6 +47,19 @@ def test_orphan_turn_is_force_closed_on_next_open():
     assert completed[0]["incomplete"] is True
 
 
+def test_open_turn_always_closes_prior_turn_even_if_under_timeout():
+    # A fresh UserStoppedSpeakingFrame means the user has moved on — the
+    # previous turn is finished whether or not it ever got a TTS response
+    # (Max may have stayed silent).  Must not silently drop.
+    ticks = iter([0.0, 2.0, 2.0, 2.0])   # only 2s gap — well under 10s
+    buf = TimingBuffer(clock=lambda: next(ticks), orphan_timeout_s=10.0)
+    buf.open_turn()                     # turn 1 at t=0
+    buf.open_turn()                     # turn 2 at t=2 — turn 1 must be closed
+    assert len(buf.completed) == 1
+    assert buf.completed[0]["turn_id"] == 1
+    assert buf.completed[0]["incomplete"] is True
+
+
 def test_first_sighting_wins_for_repeated_markers():
     ticks = iter([100.0, 100.1, 100.2])
     buf = TimingBuffer(clock=lambda: next(ticks))
