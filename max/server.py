@@ -561,6 +561,8 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     async def _on_stt(processor, frame):
         if hasattr(frame, 'text') and frame.text:
             alog(f"STT TRANSCRIPT: \"{frame.text}\"")
+            timings.record("stt_final")
+            last_transcript[bot_id] = frame.text
 
     # ── Pipeline ──
     pipeline = Pipeline([
