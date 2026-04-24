@@ -1002,6 +1002,32 @@ async def debug():
     }
 
 
+@app.get("/debug/timings")
+async def debug_timings():
+    """Per-turn latency breakdown — newest last.
+
+    ``deltas_ms`` is the human-readable breakdown.  Raw ``T_*`` timestamps
+    are intentionally omitted from the view (they're monotonic seconds
+    and not directly useful); cross-check via ``/debug`` → ``diag_log``.
+    """
+    turns = timings.snapshot()
+    view = [
+        {
+            "turn_id":    t.get("turn_id"),
+            "transcript": t.get("transcript", ""),
+            "tool_calls": t.get("tool_calls", []),
+            "deltas_ms":  t.get("deltas_ms", {}),
+            "incomplete": t.get("incomplete", False),
+        }
+        for t in turns
+    ]
+    return {
+        "count": len(view),
+        "turns": view,
+        "as_of": time.strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
