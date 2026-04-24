@@ -324,9 +324,16 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             await self.push_frame(frame, direction)
 
     # ── Timing tap: passive observer, records frame timestamps ──
-    # Placed LATE in the pipeline (just before transport.output) so every frame
-    # emitted anywhere upstream flows through this tap on its way out.  One
-    # instance suffices.
+    # Placed AFTER tts and BEFORE aggregator.assistant.  The assistant
+    # aggregator consumes LLM control frames (LLMFullResponseStartFrame
+    # etc.) to rebuild conversation context and doesn't forward them
+    # downstream — so a tap placed later (right before transport.output)
+    # only sees TTSAudioRawFrame.  Placing the tap upstream of the
+    # aggregator catches the full frame set.
+    #
+    # Also taps TranscriptionFrame directly rather than relying on the
+    # stt.on_transcription event handler, which was observed to not fire
+    # in Pipecat 0.0.108 during the 2026-04-24 diagnostic run.
     #
     # CRITICAL: must call `await super().process_frame(frame, direction)` FIRST,
     # then pass the frame through via `push_frame`.  Skipping super() stalls
@@ -341,6 +348,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             try:
                 from pipecat.frames.frames import (
                     UserStoppedSpeakingFrame,
+                    TranscriptionFrame,
                     LLMFullResponseStartFrame,
                     LLMTextFrame,
                     LLMFullResponseEndFrame,
@@ -350,6 +358,12 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
                 if isinstance(frame, UserStoppedSpeakingFrame):
                     tid = timings.open_turn()
                     alog(f"TIMING turn={tid} speech_end")
+                elif isinstance(frame, TranscriptionFrame):
+                    # STT final transcript arrives as a TranscriptionFrame
+                    # flowing downstream from the STT service.
+                    timings.record("stt_final")
+                    if getattr(frame, "text", ""):
+                        last_transcript[bot_id] = frame.text
                 elif isinstance(frame, LLMFullResponseStartFrame):
                     timings.record("llm_response_start")
                 elif isinstance(frame, LLMTextFrame):
@@ -565,6 +579,9 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             last_transcript[bot_id] = frame.text
 
     # ── Pipeline ──
+    # timing_tap is placed BEFORE aggregator.assistant so it sees the full
+    # control-frame stream (the assistant aggregator consumes LLM response
+    # start/end/text frames to rebuild context and doesn't forward them).
     pipeline = Pipeline([
         transport.input(),
         stt,
@@ -572,11 +589,11 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         llm,
         silence_filter,   # drops "..." before TTS sees it
         tts,
+        timing_tap,       # passive timing observer — upstream of assistant aggregator
         aggregator_pair.assistant(),
-        timing_tap,       # passive timing observer — no frame mutation
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→Claude→filter→TTS→tap→transport")
+    alog("PIPELINE built: transport→STT→Claude→filter→TTS→tap→aggregator→transport")
 
     task = PipelineTask(
         pipeline,
