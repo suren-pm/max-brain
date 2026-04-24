@@ -323,6 +323,49 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
                     return
             await self.push_frame(frame, direction)
 
+    # ── Timing tap: passive observer, records frame timestamps ──
+    # Placed LATE in the pipeline (just before transport.output) so every frame
+    # emitted anywhere upstream flows through this tap on its way out.  One
+    # instance suffices.
+    #
+    # CRITICAL: must call `await super().process_frame(frame, direction)` FIRST,
+    # then pass the frame through via `push_frame`.  Skipping super() stalls
+    # the pipeline on StartFrame (same bug that killed DiagLogger and the
+    # original SilenceTextFilter — see memory/projects/max-ai-employee.md).
+    #
+    # Instrumentation MUST NEVER break the pipeline — all recording is wrapped
+    # in try/except so a bug here can't silence Max.
+    class TimingTap(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            try:
+                from pipecat.frames.frames import (
+                    UserStoppedSpeakingFrame,
+                    LLMFullResponseStartFrame,
+                    LLMTextFrame,
+                    LLMFullResponseEndFrame,
+                    TTSStartedFrame,
+                    TTSAudioRawFrame,
+                )
+                if isinstance(frame, UserStoppedSpeakingFrame):
+                    tid = timings.open_turn()
+                    alog(f"TIMING turn={tid} speech_end")
+                elif isinstance(frame, LLMFullResponseStartFrame):
+                    timings.record("llm_response_start")
+                elif isinstance(frame, LLMTextFrame):
+                    # First LLMTextFrame of the turn = time-to-first-token.
+                    # record() is first-sighting-wins, so repeats are free.
+                    timings.record("llm_first_token")
+                elif isinstance(frame, LLMFullResponseEndFrame):
+                    timings.record("llm_response_end")
+                elif isinstance(frame, TTSStartedFrame):
+                    timings.record("tts_started")
+                elif isinstance(frame, TTSAudioRawFrame):
+                    timings.record("tts_first_audio")
+            except Exception as e:
+                alog(f"TIMING TAP EXC: {e}")
+            await self.push_frame(frame, direction)
+
     try:
         from pipecat.utils.asyncio import TaskManager
         TaskManager.set_event_loop(TaskManager, asyncio.get_running_loop())
@@ -506,6 +549,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
 
     # ── Silence filter instance ──
     silence_filter = SilenceTextFilter()
+    timing_tap = TimingTap()
 
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -527,9 +571,10 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         silence_filter,   # drops "..." before TTS sees it
         tts,
         aggregator_pair.assistant(),
+        timing_tap,       # passive timing observer — no frame mutation
         transport.output(),
     ])
-    alog("PIPELINE built: transport→STT→Claude→filter→TTS→transport")
+    alog("PIPELINE built: transport→STT→Claude→filter→TTS→tap→transport")
 
     task = PipelineTask(
         pipeline,
