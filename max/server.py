@@ -753,6 +753,23 @@ async def ws_pipecat(websocket: WebSocket, bot_id: str):
                         audio_chunks_out += 1
                         # Update timestamp so silence sender yields to real TTS
                         last_real_audio_time[bot_id] = time.time()
+                        # TIMING: close the active turn on the first real audio
+                        # chunk after a new T_speech_end.  close_turn() is a
+                        # no-op if no turn is open, so subsequent chunks within
+                        # the same turn are free.
+                        if timings.current is not None:
+                            done = timings.close_turn(transcript=last_transcript.get(bot_id, ""))
+                            if done:
+                                d = done.get("deltas_ms", {})
+                                alog(
+                                    f"TIMING turn={done['turn_id']} "
+                                    f"total={d.get('total_ms','?')}ms "
+                                    f"stt={d.get('stt_wait_ms','?')} "
+                                    f"llm_prefill={d.get('llm_prefill_ms','?')} "
+                                    f"tts_wait={d.get('tts_wait_ms','?')} "
+                                    f"bridge_wait={d.get('bridge_wait_ms','?')} "
+                                    f"tools={len(done.get('tool_calls', []))}"
+                                )
                         if audio_chunks_out <= 3 or audio_chunks_out % 100 == 0:
                             alog(f"BRIDGE Pipecat→MBaaS: chunk #{audio_chunks_out} ({len(audio)} bytes)")
                         client_ws = client_connections.get(bot_id)
