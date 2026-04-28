@@ -844,9 +844,12 @@ async def join_meeting(request: Request):
     # Bot avatar — public URL to a static image.  Meeting BaaS uses this as
     # Max's profile picture in the Google Meet participant tile.
     # Hosted via GitHub raw on the deployed branch.
+    # Cache-bust the GitHub raw URL when the image content changes — bump ?v=N
+    # so MBaaS / GitHub CDN doesn't serve a stale copy of the previous image.
+    # v=1: 512x512 square (initial). v=2: 1280x698 widescreen (no black bars).
     bot_image_url = os.getenv(
         "BOT_IMAGE_URL",
-        "https://raw.githubusercontent.com/suren-pm/max-brain/main/max/assets/max_avatar.png",
+        "https://raw.githubusercontent.com/suren-pm/max-brain/main/max/assets/max_avatar.png?v=2",
     )
 
     # Token cost minimisation:
