@@ -598,7 +598,15 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
+            # allow_interruptions disabled to prevent acoustic-feedback self-
+            # interruption when running on laptop speakers (mic picks up Max's
+            # TTS, VAD reads it as user speech, pipeline cuts Max off mid-
+            # sentence — observed 2026-04-28 on the pre-final demo run).
+            # Trade-off: Max always finishes his sentence even if a real user
+            # tries to talk over him.  Acceptable for approval-demo context.
+            # Re-enable when running on a setup with proper headphones / no
+            # acoustic loopback.
+            allow_interruptions=False,
             check_dangling_tasks=True,
         ),
     )
