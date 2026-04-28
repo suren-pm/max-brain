@@ -278,7 +278,11 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         from pipecat.pipeline.task import PipelineParams, PipelineTask
         from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
         from pipecat.serializers.protobuf import ProtobufFrameSerializer
-        from pipecat.services.anthropic.llm import AnthropicLLMService
+        # ── EXPERIMENT (branch: experiment/gemini-llm) ──
+        # Swapping AnthropicLLMService for GoogleLLMService (Gemini) to test
+        # whether persona/character holds across LLM vendors with the same
+        # system prompt.  Revert to Anthropic by checking out main.
+        from pipecat.services.google.llm import GoogleLLMService
         from pipecat.services.deepgram.stt import DeepgramSTTService
         from pipecat.services.deepgram.tts import DeepgramTTSService
         # Try both import paths for WebSocket transport (changed between versions)
@@ -421,10 +425,10 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         language="en",
     )
 
-    # ── LLM: Claude ──
-    llm = AnthropicLLMService(
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
-        model="claude-haiku-4-5-20251001",
+    # ── LLM: Gemini (experiment branch — see import comment above) ──
+    llm = GoogleLLMService(
+        api_key=os.getenv("GEMINI_API_KEY"),
+        model="gemini-2.5-flash",
     )
 
     # ── Tool timing wrapper ──
