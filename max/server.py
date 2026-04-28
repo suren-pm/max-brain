@@ -841,17 +841,30 @@ async def join_meeting(request: Request):
         "https://raw.githubusercontent.com/suren-pm/max-brain/main/max/assets/max_avatar.png",
     )
 
+    # Token cost minimisation:
+    # - recording_mode "audio_only" is the minimum — MBaaS v2 doesn't allow
+    #   fully disabling recording (no "none" enum value).  audio_only drops
+    #   video MP4 + screenshots artefacts.
+    # - transcription_enabled false is explicit (it's the API default but we
+    #   set it so a future MBaaS default change doesn't quietly start charging
+    #   us +0.25 tokens/hour for Gladia transcription we don't use.
+    # - no_one_joined_timeout 90s + waiting_room_timeout 60s prevent Max from
+    #   sitting in an empty meeting and silently burning recording tokens.
     payload = {
-        "bot_name":    bot_name,
-        "bot_image":   bot_image_url,
-        "meeting_url": meeting_url,
-        "streaming_enabled": True,
+        "bot_name":            bot_name,
+        "bot_image":           bot_image_url,
+        "meeting_url":         meeting_url,
+        "recording_mode":      "audio_only",
+        "transcription_enabled": False,
+        "no_one_joined_timeout": 90,
+        "waiting_room_timeout":  60,
+        "streaming_enabled":   True,
         "streaming_config": {
             "input_url":       ws_url,
             "output_url":      ws_url,
             "audio_frequency": SAMPLE_RATE,
         },
-        "extra":       {},
+        "extra":               {},
     }
 
     api_key = os.getenv("MEETING_BAAS_API_KEY", "")
