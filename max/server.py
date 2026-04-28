@@ -554,7 +554,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # ── TTS: Deepgram streaming WebSocket ──
     tts = DeepgramTTSService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
-        voice="aura-arcas-en",
+        voice="aura-asteria-en",   # female voice — Aura Asteria (friendly, warm)
         sample_rate=SAMPLE_RATE,
     )
 
@@ -833,8 +833,17 @@ async def join_meeting(request: Request):
     # MBaaS v2 streaming-only — NO recording_mode (that activates recording +
     # transcription services which bleed ~1.35 tokens/hr).  Streaming-only costs
     # ~0.10 tokens/hr since we handle STT/TTS ourselves via Pipecat.
+    # Bot avatar — public URL to a static image.  Meeting BaaS uses this as
+    # Max's profile picture in the Google Meet participant tile.
+    # Hosted via GitHub raw on the deployed branch.
+    bot_image_url = os.getenv(
+        "BOT_IMAGE_URL",
+        "https://raw.githubusercontent.com/suren-pm/max-brain/main/max/assets/max_avatar.png",
+    )
+
     payload = {
         "bot_name":    bot_name,
+        "bot_image":   bot_image_url,
         "meeting_url": meeting_url,
         "streaming_enabled": True,
         "streaming_config": {
