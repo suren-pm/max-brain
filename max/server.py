@@ -157,99 +157,219 @@ def protobuf_to_raw(proto_data: bytes) -> Optional[bytes]:
     return None
 
 
-# ── Jira helpers ──────────────────────────────────────────────────────────────
+# ── Linear helpers (replaced Jira, 2026-10-22) ────────────────────────────────
+# Personal API key in LINEAR_API_KEY (plain Authorization header, no "Bearer").
+# Team key in LINEAR_TEAM_KEY (default ENG). Read-only usage.
 
-def _jira_auth() -> Optional[str]:
-    email = os.getenv("JIRA_EMAIL")
-    token = os.getenv("JIRA_API_TOKEN")
-    if not (email and token):
-        return None
-    return base64.b64encode(f"{email}:{token}".encode()).decode()
+LINEAR_API = "https://api.linear.app/graphql"
+
+def _linear_team() -> str:
+    return os.getenv("LINEAR_TEAM_KEY", "ENG")
 
 def _normalize_ticket_id(raw: str) -> str:
-    raw = raw.strip().upper()
-    if re.match(r"[A-Z]+-\d+", raw):
+    raw = raw.strip().upper().replace(" ", "")
+    if re.match(r"^[A-Z]+-\d+$", raw):
         return raw
     digits = re.sub(r"[^0-9]", "", raw)
     if digits:
-        project = os.getenv("JIRA_PROJECT_KEY", "ESB")
-        return f"{project}-{digits}"
+        return f"{_linear_team()}-{digits}"
     return raw
 
-async def jira_get_ticket(ticket_id: str) -> dict:
-    auth = _jira_auth()
-    if not auth:
-        return {"error": "Jira not configured"}
-    base = os.getenv("JIRA_URL", "https://everperform.atlassian.net")
-    project = os.getenv("JIRA_PROJECT_KEY", "ESB")
+async def _linear(query: str, variables: Optional[dict] = None) -> dict:
+    key = os.getenv("LINEAR_API_KEY")
+    if not key:
+        return {"errors": [{"message": "Linear not configured (LINEAR_API_KEY missing)"}]}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            LINEAR_API,
+            json={"query": query, "variables": variables or {}},
+            headers={"Authorization": key, "Content-Type": "application/json"},
+            timeout=10,
+        )
+    return resp.json()
+
+_ISSUE_FIELDS = """
+  identifier title updatedAt priorityLabel
+  state { name }
+  assignee { name }
+  cycle { number isActive isNext }
+  releases { nodes { name stage { name type } } }
+  parent { identifier title parent { identifier title parent { identifier title } } }
+"""
+
+def _ancestors(i: dict) -> list[dict]:
+    """Parent chain, nearest first: [{"id", "title"}, ...]."""
+    out, p = [], i.get("parent")
+    while p:
+        out.append({"id": p.get("identifier"), "title": p.get("title")})
+        p = p.get("parent")
+    return out
+
+def _ticket_summary(i: dict) -> dict:
+    cyc = i.get("cycle") or {}
+    return {
+        "id":       i.get("identifier"),
+        "title":    i.get("title"),
+        "status":   (i.get("state") or {}).get("name"),
+        "assignee": (i.get("assignee") or {}).get("name", "unassigned"),
+        "priority": i.get("priorityLabel"),
+        "cycle":    cyc.get("number"),
+        "releases": [r.get("name") for r in ((i.get("releases") or {}).get("nodes") or [])],
+        "parent":   (_ancestors(i) or [None])[0],
+    }
+
+async def linear_get_ticket(ticket_id: str) -> dict:
     ticket_id = _normalize_ticket_id(ticket_id)
-    alog(f"JIRA lookup: {ticket_id}")
+    alog(f"LINEAR lookup: {ticket_id}")
+    q = "query($id: String!) { issue(id: $id) {" + _ISSUE_FIELDS + "} }"
 
-    async def _try_fetch(tid: str) -> Optional[dict]:
+    async def _try(tid: str) -> Optional[dict]:
         try:
-            url = f"{base}/rest/api/3/issue/{tid}?fields=summary,status,assignee,priority"
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    url,
-                    headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
-                    timeout=10,
-                )
-            alog(f"JIRA {tid} → HTTP {resp.status_code}")
-            if resp.status_code == 200:
-                d = resp.json()
-                f = d.get("fields", {})
-                return {
-                    "id":       d.get("key"),
-                    "summary":  f.get("summary"),
-                    "status":   f.get("status", {}).get("name"),
-                    "assignee": (f.get("assignee") or {}).get("displayName", "unassigned"),
-                    "priority": (f.get("priority") or {}).get("name"),
-                }
+            d = await _linear(q, {"id": tid})
+            i = (d.get("data") or {}).get("issue")
+            alog(f"LINEAR {tid} -> {'found' if i else 'not found'}")
+            return _ticket_summary(i) if i else None
         except Exception as e:
-            alog(f"JIRA EXC {tid}: {e}")
-        return None
+            alog(f"LINEAR EXC {tid}: {e}")
+            return None
 
-    result = await _try_fetch(ticket_id)
+    result = await _try(ticket_id)
     if result:
         return result
     # Fallback for short numbers (STT drops leading digits)
     digits = re.sub(r"[^0-9]", "", ticket_id)
     if digits and len(digits) <= 3:
         for prefix in ["1", "2"]:
-            fallback_id = f"{project}-{prefix}{digits}"
-            result = await _try_fetch(fallback_id)
+            result = await _try(f"{_linear_team()}-{prefix}{digits}")
             if result:
                 return result
     return {"error": f"Ticket {ticket_id} not found. Ask them to repeat the number."}
 
-async def jira_testing_tickets() -> list[dict]:
-    auth = _jira_auth()
-    if not auth:
-        return []
-    base = os.getenv("JIRA_URL", "https://everperform.atlassian.net")
-    project = os.getenv("JIRA_PROJECT_KEY", "ESB")
+# General ticket search (2026-10-22, Suren: "don't hard-code — let the LLM think
+# and use the tools"). The tool returns facts (each ticket's parent, cycle,
+# releases, plus counts) and Max decides how to slice and phrase the answer.
+
+def _find_query(with_state: bool) -> str:
+    state = ", state: { name: { eqIgnoreCase: $state } }" if with_state else ""
+    state_var = ", $state: String" if with_state else ""
+    return ("query($team: String!, $after: String" + state_var + ") {\n"
+            "  issues(first: 100, after: $after, orderBy: updatedAt,\n"
+            "         filter: { team: { key: { eq: $team } }" + state + " }) {\n"
+            "    nodes {" + _ISSUE_FIELDS + "}\n"
+            "    pageInfo { hasNextPage endCursor }\n  }\n}")
+
+_RELEASES_QUERY = """
+query($after: String) {
+  releases(first: 100, after: $after) {
+    nodes { name targetDate stage { type } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+
+async def _paged(query: str, root: str, variables: dict, max_pages: int = 10) -> list[dict]:
+    out, after = [], None
+    for _ in range(max_pages):
+        d = await _linear(query, {**variables, "after": after})
+        if d.get("errors"):
+            raise RuntimeError(str(d["errors"])[:200])
+        conn = d["data"][root]
+        out += conn["nodes"]
+        if not conn["pageInfo"]["hasNextPage"]:
+            break
+        after = conn["pageInfo"]["endCursor"]
+    return out
+
+def _release_names(i: dict, stage_type: Optional[str] = None) -> list[str]:
+    return [r.get("name") for r in ((i.get("releases") or {}).get("nodes") or [])
+            if stage_type is None or (r.get("stage") or {}).get("type") == stage_type]
+
+def _cycle_label(i: dict) -> str:
+    c = i.get("cycle")
+    return f"cycle {c.get('number')}" if c else "no cycle"
+
+async def linear_find_tickets(args: dict) -> dict:
+    from collections import Counter
+    args = args or {}
+    status = str(args.get("status") or "Testing").strip()
+    any_status = status.lower() in ("any", "all")
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{base}/rest/api/3/search"
-                f'?jql=project={project}+AND+status="Testing"+ORDER+BY+priority+DESC'
-                f"&fields=summary,status,assignee&maxResults=15",
-                headers={"Authorization": f"Basic {auth}", "Accept": "application/json"},
-                timeout=10,
-            )
-        if resp.status_code == 200:
-            return [
-                {
-                    "id":       i["key"],
-                    "summary":  i["fields"]["summary"],
-                    "status":   i["fields"]["status"]["name"],
-                    "assignee": (i["fields"].get("assignee") or {}).get("displayName", "unassigned"),
-                }
-                for i in resp.json().get("issues", [])
-            ]
+        if any_status:
+            issues = await _paged(_find_query(False), "issues", {"team": _linear_team()}, max_pages=3)
+        else:
+            issues = await _paged(_find_query(True), "issues", {"team": _linear_team(), "state": status})
+        releases = await _paged(_RELEASES_QUERY, "releases", {})
     except Exception as e:
-        logger.error(f"Jira query error: {e}")
-    return []
+        logger.error(f"Linear query error: {e}")
+        return {"error": "Couldn't reach Linear right now."}
+
+    current_releases = [r["name"] for r in releases if (r.get("stage") or {}).get("type") == "started"]
+    upcoming_releases = [r["name"] for r in releases if (r.get("stage") or {}).get("type") == "planned"]
+    active_cycle = next(((i.get("cycle") or {}).get("number") for i in issues
+                         if (i.get("cycle") or {}).get("isActive")), None)
+
+    sel = issues
+    cyc = str(args.get("cycle") or "").strip().lower()
+    if cyc in ("current", "this", "active"):
+        sel = [i for i in sel if (i.get("cycle") or {}).get("isActive")]
+    elif cyc in ("next", "upcoming"):
+        sel = [i for i in sel if (i.get("cycle") or {}).get("isNext")]
+    elif cyc in ("none", "no cycle"):
+        sel = [i for i in sel if not i.get("cycle")]
+    elif cyc.isdigit():
+        sel = [i for i in sel if (i.get("cycle") or {}).get("number") == int(cyc)]
+    rel = str(args.get("release") or "").strip()
+    if rel.lower() in ("current", "active", "in progress"):
+        sel = [i for i in sel if _release_names(i, "started")]
+    elif rel.lower() in ("upcoming", "next", "planned"):
+        sel = [i for i in sel if _release_names(i, "planned")]
+    elif rel.lower() in ("none", "no release"):
+        sel = [i for i in sel if not _release_names(i)]
+    elif rel:
+        sel = [i for i in sel if any(n == rel or n.startswith(rel) for n in _release_names(i))]
+    if args.get("top_level_only"):
+        sel = [i for i in sel if not i.get("parent")]
+    if args.get("parent"):
+        pid = _normalize_ticket_id(str(args["parent"]))
+        sel = [i for i in sel if any(a["id"] == pid for a in _ancestors(i))]
+    who = str(args.get("assignee") or "").strip().lower()
+    if who:
+        sel = [i for i in sel if who in ((i.get("assignee") or {}).get("name") or "").lower()]
+    txt = str(args.get("text") or "").strip().lower()
+    if txt:
+        sel = [i for i in sel if txt in (i.get("title") or "").lower()]
+
+    roots = Counter()
+    for i in sel:
+        anc = _ancestors(i)
+        root = anc[-1] if anc else {"id": i["identifier"], "title": i["title"]}
+        roots[(root["id"], root["title"])] += 1
+    top_level = sum(1 for i in sel if not i.get("parent"))
+    try:
+        limit = max(1, min(50, int(args.get("limit") or 15)))
+    except (TypeError, ValueError):
+        limit = 15
+    chosen = sorted(sel, key=lambda i: i.get("updatedAt") or "", reverse=True)[:limit]
+    return {
+        "count": len(sel),
+        "filters": {k: v for k, v in args.items() if v not in (None, "", False)},
+        "breakdown": {
+            "top_level": top_level,
+            "sub_issues": len(sel) - top_level,
+            "top_level_parent_groups": len(roots),
+            "by_top_level_parent": [{"id": k[0], "title": k[1], "count": v} for k, v in roots.most_common(10)],
+            "by_cycle": dict(Counter(_cycle_label(i) for i in sel)),
+            "by_release": dict(Counter(n for i in sel for n in (_release_names(i) or ["no release"]))),
+        },
+        "context": {
+            "current_cycle": active_cycle,
+            "current_releases": current_releases or "none in progress",
+            "upcoming_releases": upcoming_releases or "none planned in Linear",
+        },
+        "tickets": [_ticket_summary(i) for i in chosen],
+        "more": max(0, len(sel) - limit),
+        **({"note": f"Only the {len(issues)} most recently updated tickets were scanned, so counts are partial."}
+           if any_status and len(issues) >= 300 else {}),
+    }
 
 
 # ── Pipecat Pipeline (runs in-process as asyncio task) ────────────────────────
@@ -446,13 +566,13 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         return _wrapper
 
     # ── Register tool functions ──
-    async def tool_get_jira_ticket(params: FunctionCallParams):
-        result = await jira_get_ticket(params.arguments.get("ticket_id", ""))
+    async def tool_get_ticket(params: FunctionCallParams):
+        result = await linear_get_ticket(params.arguments.get("ticket_id", ""))
         await params.result_callback(json.dumps(result))
 
-    async def tool_get_testing_tickets(params: FunctionCallParams):
-        tickets = await jira_testing_tickets()
-        await params.result_callback(json.dumps(tickets))
+    async def tool_find_tickets(params: FunctionCallParams):
+        result = await linear_find_tickets(dict(params.arguments or {}))
+        await params.result_callback(json.dumps(result))
 
     async def tool_log_task(params: FunctionCallParams):
         task = {
@@ -499,8 +619,8 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         alog(f"NOTE saved: {note['speaker']} — {note['summary'][:60]}")
         await params.result_callback(json.dumps({"ok": True, "note": note, "total_notes": len(standup_notes)}))
 
-    llm.register_function("get_jira_ticket",      _timed("get_jira_ticket",      tool_get_jira_ticket))
-    llm.register_function("get_testing_tickets",  _timed("get_testing_tickets",  tool_get_testing_tickets))
+    llm.register_function("get_ticket",           _timed("get_ticket",           tool_get_ticket))
+    llm.register_function("find_tickets",         _timed("find_tickets",         tool_find_tickets))
     llm.register_function("log_task",             _timed("log_task",             tool_log_task))
     llm.register_function("get_test_results",     _timed("get_test_results",     tool_get_test_results))
     llm.register_function("get_standup_briefing", _timed("get_standup_briefing", tool_get_standup_briefing))
@@ -509,24 +629,38 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # ── Tool schemas ──
     tools = ToolsSchema(standard_tools=[
         FunctionSchema(
-            name="get_jira_ticket",
-            description="Fetch details of a Jira ticket by ID (e.g. ESB-1275).",
+            name="get_ticket",
+            description="Fetch a Linear ticket by ID (e.g. ENG-2417): title, status, assignee, priority, cycle, releases.",
             properties={
-                "ticket_id": {"type": "string", "description": "Jira ticket ID like ESB-1275 or just the number"}
+                "ticket_id": {"type": "string", "description": "Linear ticket ID like ENG-2417, or just the number"}
             },
             required=["ticket_id"],
         ),
         FunctionSchema(
-            name="get_testing_tickets",
-            description="Get all Jira tickets currently in Testing status.",
-            properties={},
+            name="find_tickets",
+            description=(
+                "Search the team's Linear tickets. Every filter is optional and they combine. Returns the "
+                "true count, a breakdown (top-level vs sub-issues, by top-level parent, by cycle, by release), "
+                "context (current cycle, current and upcoming releases) and the most recently updated matches, "
+                "each with its status, assignee, cycle, releases and parent."
+            ),
+            properties={
+                "status":         {"type": "string",  "description": "Workflow status such as Testing, In Review, In Progress, Blocked, Ready, Done. Default Testing. Use 'any' for every status."},
+                "cycle":          {"type": "string",  "description": "'current', 'next', 'none', or a cycle number."},
+                "release":        {"type": "string",  "description": "'current', 'upcoming', 'none', or a release name such as 3.8.0."},
+                "top_level_only": {"type": "boolean", "description": "Only top-level tickets, i.e. parent tickets, not sub-issues."},
+                "parent":         {"type": "string",  "description": "Only tickets underneath this ticket, e.g. ENG-1518."},
+                "assignee":       {"type": "string",  "description": "Part of the assignee's name."},
+                "text":           {"type": "string",  "description": "Words that appear in the ticket title."},
+                "limit":          {"type": "integer", "description": "How many tickets to list (default 15, max 50). The count is always the full number."},
+            },
             required=[],
         ),
         FunctionSchema(
             name="log_task",
             description="Log a task assigned to you in standup for testing.",
             properties={
-                "ticket_id":   {"type": "string", "description": "Jira ticket ID"},
+                "ticket_id":   {"type": "string", "description": "Linear ticket ID like ENG-2417"},
                 "description": {"type": "string", "description": "What needs to be tested"},
             },
             required=["ticket_id"],
@@ -571,8 +705,13 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
 
     # ── Context ──
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    context = OpenAILLMContext(messages, tools)
-    aggregator_pair = llm.create_context_aggregator(context)
+    # Universal context (2026-10-22). The legacy OpenAILLMContext path drops
+    # Gemini 3.x thought signatures, so every tool call's follow-up request
+    # failed with 400 "Function call is missing a thought_signature".
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+    context = LLMContext(messages, tools)
+    aggregator_pair = LLMContextAggregatorPair(context)
 
     # ── Event-based debug logging (safe — no custom FrameProcessor) ──
     @stt.event_handler("on_transcription")
@@ -610,9 +749,16 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
             # tries to talk over him.  Acceptable for approval-demo context.
             # Re-enable when running on a setup with proper headphones / no
             # acoustic loopback.
-            allow_interruptions=False,
+            allow_interruptions=True,  # 2026-10-22, Suren: Max can be interrupted like a person.
+            # The April acoustic loop is gone on the Mac: Max's mic is an in-page
+            # channel (never the room mic) and his tab plays into BlackHole, not
+            # the speakers, so Max does not hear himself (verified 2026-10-22).
             check_dangling_tasks=True,
         ),
+        # 2026-10-22: Pipecat's default kills the pipeline after 300s with no one
+        # speaking, which left Max sitting in the Meet deaf and mute. Max stays
+        # until the meeting ends; a closed bot socket still ends the pipeline.
+        idle_timeout_secs=None,
     )
 
     # Greeting REMOVED — it doesn't help with first-utterance detection.
