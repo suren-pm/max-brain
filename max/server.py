@@ -428,7 +428,7 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # ── LLM: Gemini (self-hosted branch — see import comment above) ──
     llm = GoogleLLMService(
         api_key=os.getenv("GEMINI_API_KEY"),
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash-lite",  # 2026-10-22: Suren asked for a Flash Lite; 3.8 Lite exists only as TTS
     )
 
     # ── Tool timing wrapper ──
