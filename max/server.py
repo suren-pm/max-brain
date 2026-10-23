@@ -82,11 +82,10 @@ app.add_middleware(
 MEETING_BAAS_API = "https://api.meetingbaas.com/v2"
 SAMPLE_RATE      = 16000
 
-# ── In-memory state ───────────────────────────────────────────────────────────
-pending_tasks:  list[dict] = []
-test_results:   list[dict] = []
-briefing_cache: str        = ""
-standup_notes:  list[dict] = []  # Max's live standup notes
+# ── State ─────────────────────────────────────────────────────────────────────
+# Tasks, test results, standup notes and the briefing live in a local SQLite
+# file (max/store.py) since 2026-10-23, so a restart loses nothing.
+from max import store
 
 # ── Connection registry (MBaaS ↔ Pipecat bridge) ─────────────────────────────
 client_connections: dict[str, WebSocket] = {}   # bot_id → MBaaS WebSocket
@@ -258,6 +257,19 @@ def _find_query(with_state: bool) -> str:
             "    nodes {" + _ISSUE_FIELDS + "}\n"
             "    pageInfo { hasNextPage endCursor }\n  }\n}")
 
+_DESC_QUERY = ("query($filter: IssueFilter!, $after: String) {\n"
+               "  issues(first: 100, after: $after, filter: $filter) {\n"
+               "    nodes {" + _ISSUE_FIELDS + "}\n"
+               "    pageInfo { hasNextPage endCursor }\n  }\n}")
+
+def _descendant_filter(team: str, number: int, state: Optional[str]) -> dict:
+    """Children, grandchildren and great-grandchildren of team-number."""
+    p = {"number": {"eq": number}, "team": {"key": {"eq": team}}}
+    f: dict = {"or": [{"parent": p}, {"parent": {"parent": p}}, {"parent": {"parent": {"parent": p}}}]}
+    if state:
+        f["state"] = {"name": {"eqIgnoreCase": state}}
+    return f
+
 _RELEASES_QUERY = """
 query($after: String) {
   releases(first: 100, after: $after) {
@@ -287,17 +299,60 @@ def _cycle_label(i: dict) -> str:
     c = i.get("cycle")
     return f"cycle {c.get('number')}" if c else "no cycle"
 
+# Phase 7 (2026-10-23): find_tickets took ~1.4 s of a 4.6 s spoken answer, all
+# Linear round trips. Results are cached briefly and refreshed in the
+# background (stale-while-revalidate), and the Testing list is fetched when
+# Max joins, so most answers don't wait on Linear at all.
+_LINEAR_FRESH_SECS = 45     # newer than this: use as is
+_LINEAR_MAX_AGE_SECS = 300  # older than this: fetch before answering
+_linear_cache: dict[str, tuple[float, list]] = {}
+_linear_refreshing: set[str] = set()
+
+async def _linear_cached(key: str, fetch) -> tuple[list, float]:
+    """Returns (data, fetched_at)."""
+    hit = _linear_cache.get(key)
+    age = time.time() - hit[0] if hit else None
+    if hit and age < _LINEAR_MAX_AGE_SECS:
+        if age > _LINEAR_FRESH_SECS and key not in _linear_refreshing:
+            async def _refresh():
+                _linear_refreshing.add(key)
+                try:
+                    _linear_cache[key] = (time.time(), await fetch())
+                except Exception as e:
+                    alog(f"LINEAR refresh failed ({key}): {e}")
+                finally:
+                    _linear_refreshing.discard(key)
+            asyncio.create_task(_refresh())
+        return hit[1], hit[0]
+    data = await fetch()
+    _linear_cache[key] = (time.time(), data)
+    return data, _linear_cache[key][0]
+
 async def linear_find_tickets(args: dict) -> dict:
     from collections import Counter
     args = args or {}
     status = str(args.get("status") or "Testing").strip()
     any_status = status.lower() in ("any", "all")
+    team = _linear_team()
+    parent_id = _normalize_ticket_id(str(args["parent"])) if args.get("parent") else ""
+    if re.match(r"^[A-Z]+-\d+$", parent_id):
+        # Ask Linear for this ticket's descendants directly: exact counts in any
+        # status, where scanning recent tickets undercounted (58 vs 60, 23 Oct).
+        p_team, p_num = parent_id.split("-")
+        key = f"desc:{parent_id}:{status.lower()}"
+        fetch_issues = lambda: _paged(_DESC_QUERY, "issues", {
+            "filter": _descendant_filter(p_team, int(p_num), None if any_status else status)})
+    elif any_status:
+        key = f"issues:{team}:any"
+        fetch_issues = lambda: _paged(_find_query(False), "issues", {"team": team}, max_pages=3)
+    else:
+        key = f"issues:{team}:{status.lower()}"
+        fetch_issues = lambda: _paged(_find_query(True), "issues", {"team": team, "state": status})
     try:
-        if any_status:
-            issues = await _paged(_find_query(False), "issues", {"team": _linear_team()}, max_pages=3)
-        else:
-            issues = await _paged(_find_query(True), "issues", {"team": _linear_team(), "state": status})
-        releases = await _paged(_RELEASES_QUERY, "releases", {})
+        (issues, fetched_at), (releases, _) = await asyncio.gather(
+            _linear_cached(key, fetch_issues),
+            _linear_cached("releases", lambda: _paged(_RELEASES_QUERY, "releases", {})),
+        )
     except Exception as e:
         logger.error(f"Linear query error: {e}")
         return {"error": "Couldn't reach Linear right now."}
@@ -339,10 +394,13 @@ async def linear_find_tickets(args: dict) -> dict:
         sel = [i for i in sel if txt in (i.get("title") or "").lower()]
 
     roots = Counter()
+    root_subs = Counter()  # sub-issues only; the root ticket itself isn't one of its sub-issues
     for i in sel:
         anc = _ancestors(i)
         root = anc[-1] if anc else {"id": i["identifier"], "title": i["title"]}
         roots[(root["id"], root["title"])] += 1
+        if anc:
+            root_subs[(root["id"], root["title"])] += 1
     top_level = sum(1 for i in sel if not i.get("parent"))
     try:
         limit = max(1, min(50, int(args.get("limit") or 15)))
@@ -356,7 +414,10 @@ async def linear_find_tickets(args: dict) -> dict:
             "top_level": top_level,
             "sub_issues": len(sel) - top_level,
             "top_level_parent_groups": len(roots),
-            "by_top_level_parent": [{"id": k[0], "title": k[1], "count": v} for k, v in roots.most_common(10)],
+            # Grouped by top-level ticket: "tickets" counts the group in this
+            # selection (the top-level ticket too, if it's in it), "sub_issues" only those under it.
+            "by_top_level_parent": [{"id": k[0], "title": k[1], "tickets": v, "sub_issues": root_subs[k]}
+                                    for k, v in roots.most_common(10)],
             "by_cycle": dict(Counter(_cycle_label(i) for i in sel)),
             "by_release": dict(Counter(n for i in sel for n in (_release_names(i) or ["no release"]))),
         },
@@ -367,6 +428,7 @@ async def linear_find_tickets(args: dict) -> dict:
         },
         "tickets": [_ticket_summary(i) for i in chosen],
         "more": max(0, len(sel) - limit),
+        "as_of": time.strftime("%H:%M", time.localtime(fetched_at)),
         **({"note": f"Only the {len(issues)} most recently updated tickets were scanned, so counts are partial."}
            if any_status and len(issues) >= 300 else {}),
     }
@@ -528,7 +590,11 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
                 params=VADParams(
                     confidence=0.5,   # Lower than default 0.7 for reliable first-utterance detection
                     start_secs=0.2,   # Duration of speech needed to confirm start
-                    stop_secs=0.4,    # Reduced from 0.8 — faster response, ~400ms saved per turn
+                    # 0.2 since 2026-10-23: Smart Turn v3 now decides whether the
+                    # person has finished, so VAD only needs to spot the pause.
+                    # 0.2 is Pipecat's recommended value with Smart Turn; at 0.4
+                    # its wait for Deepgram's final transcript collapsed to 0 s.
+                    stop_secs=0.2,
                     min_volume=0.2,   # Low threshold for meeting audio
                 ),
             ),
@@ -575,49 +641,41 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
         await params.result_callback(json.dumps(result))
 
     async def tool_log_task(params: FunctionCallParams):
-        task = {
+        task = store.add_task({
             "ticket_id":   params.arguments.get("ticket_id"),
             "description": params.arguments.get("description", ""),
-            "logged_at":   time.strftime("%Y-%m-%d %H:%M IST"),
-            "status":      "pending",
-        }
-        pending_tasks.append(task)
+        })
         alog(f"TASK logged: {task['ticket_id']}")
         await params.result_callback(json.dumps({"ok": True, "task": task}))
 
+    # Results since the previous working day (Monday sees Friday's), so Max can
+    # say what was tested since the last standup. Each result carries its date.
     async def tool_get_test_results(params: FunctionCallParams):
-        import datetime
-        # Only return yesterday's results — standup is in the morning, tests ran yesterday afternoon
-        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        yesterday_results = [r for r in test_results if r.get("posted_at", "").startswith(yesterday)]
+        since = store.previous_working_day()
         await params.result_callback(json.dumps({
-            "results": yesterday_results,
-            "pending": [t for t in pending_tasks if t.get("status") == "pending"],
-            "date": yesterday,
+            "results": store.list_results(since_day=since),
+            "pending": store.list_tasks(status="pending"),
+            "since":   since,
         }))
 
     async def tool_get_standup_briefing(params: FunctionCallParams):
-        import datetime
-        # Only return yesterday's completed tests for standup update
-        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        yesterday_results = [r for r in test_results if r.get("posted_at", "").startswith(yesterday)]
+        since = store.previous_working_day()
         await params.result_callback(json.dumps({
-            "briefing":        briefing_cache or "No briefing available.",
-            "completed_tests": yesterday_results[-5:],
-            "pending_tasks":   [t for t in pending_tasks if t.get("status") == "pending"],
-            "date": yesterday,
+            "briefing":        store.get_briefing() or "No briefing available.",
+            "completed_tests": store.list_results(since_day=since)[-5:],
+            "pending_tasks":   store.list_tasks(status="pending"),
+            "since":           since,
         }))
 
     async def tool_save_standup_note(params: FunctionCallParams):
-        note = {
+        note = store.add_note({
             "speaker":    params.arguments.get("speaker", "unknown"),
             "summary":    params.arguments.get("summary", ""),
             "action_items": params.arguments.get("action_items", ""),
             "timestamp":  time.strftime("%H:%M IST"),
-        }
-        standup_notes.append(note)
+        })
         alog(f"NOTE saved: {note['speaker']} — {note['summary'][:60]}")
-        await params.result_callback(json.dumps({"ok": True, "note": note, "total_notes": len(standup_notes)}))
+        await params.result_callback(json.dumps({"ok": True, "note": note, "total_notes": len(store.list_notes())}))
 
     llm.register_function("get_ticket",           _timed("get_ticket",           tool_get_ticket))
     llm.register_function("find_tickets",         _timed("find_tickets",         tool_find_tickets))
@@ -709,9 +767,14 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # Gemini 3.x thought signatures, so every tool call's follow-up request
     # failed with 400 "Function call is missing a thought_signature".
     from pipecat.processors.aggregators.llm_context import LLMContext
-    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+    from pipecat.processors.aggregators.llm_response_universal import (
+        LLMContextAggregatorPair, LLMUserAggregatorParams)
     context = LLMContext(messages, tools)
-    aggregator_pair = LLMContextAggregatorPair(context)
+    # Phase 7 (2026-10-23): when Deepgram's final transcript lands just after
+    # Smart Turn says "done", nothing ends the turn until this fallback fires
+    # (default 5 s; measured: a 5.0 s stall before Max answered). 1.5 s caps it.
+    aggregator_pair = LLMContextAggregatorPair(
+        context, user_params=LLMUserAggregatorParams(user_turn_stop_timeout=1.5))
 
     # ── Event-based debug logging (safe — no custom FrameProcessor) ──
     @stt.event_handler("on_transcription")
@@ -764,6 +827,14 @@ async def _run_pipecat_pipeline_inner(bot_id: str):
     # Greeting REMOVED — it doesn't help with first-utterance detection.
     # The continuous silence sender in ws_meetingbaas keeps the Google Meet
     # audio channel warm instead. Max joins silently and responds when spoken to.
+
+    # Warm the Linear cache (Testing list + releases) while Max settles in.
+    async def _prefetch_linear():
+        t0 = time.monotonic()
+        result = await linear_find_tickets({})
+        alog(f"LINEAR prefetch: {result.get('count', result.get('error'))} in "
+             f"{(time.monotonic() - t0) * 1000:.0f} ms")
+    asyncio.create_task(_prefetch_linear())
 
     # ── Run ──
     runner = PipelineRunner()
@@ -898,7 +969,7 @@ async def ws_meetingbaas(websocket: WebSocket, bot_id: str):
             pass
         closing_clients.discard(bot_id)
         # Post standup notes to callback if any were captured
-        if standup_notes:
+        if store.list_notes():
             asyncio.create_task(_post_meeting_notes_callback())
         alog(f"WS/MBaaS cleanup done: {bot_id}")
 
@@ -979,7 +1050,11 @@ async def join_meeting(request: Request):
 
     if not meeting_url:
         return {"error": "meeting_url required (or set GOOGLE_MEET_URL env var)"}
+    return await _join_via_bot(meeting_url, bot_name, body.get("max_minutes"))
 
+
+async def _join_via_bot(meeting_url: str, bot_name: str = "Max",
+                        max_minutes: Optional[float] = None) -> dict:
     # max-bot (self-hosted). When max-bot's /join succeeds, max-bot opens
     # an outbound WebSocket to OUR /ws/{bot_id} endpoint and starts
     # streaming captured audio in. The bot_id is generated by max-bot.
@@ -993,6 +1068,8 @@ async def join_meeting(request: Request):
         "meeting_url": meeting_url,
         "bot_name":    bot_name,
     }
+    if max_minutes:
+        payload["max_minutes"] = max_minutes  # max-bot leaves after this long
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -1012,41 +1089,89 @@ async def join_meeting(request: Request):
     return {"error": f"max-bot {resp.status_code}", "detail": resp.text[:200]}
 
 
+# ── Scheduled standup join (2026-10-23, Phase 4b) ─────────────────────────────
+# While max-brain is running, Max joins AUTO_JOIN_URL at AUTO_JOIN_TIME (the
+# Mac's local time) on AUTO_JOIN_DAYS and leaves after AUTO_JOIN_MAX_MINUTES,
+# or earlier once everyone else has gone (max-bot's watchdog). Off unless
+# AUTO_JOIN_URL is set. If the Mac was asleep at the time, Max still joins up
+# to AUTO_JOIN_LATE_MINUTES late.
+
+_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+def _auto_join_config() -> Optional[dict]:
+    url = os.getenv("AUTO_JOIN_URL", "").strip()
+    if not url:
+        return None
+    hh, mm = (os.getenv("AUTO_JOIN_TIME", "07:29").split(":") + ["0"])[:2]
+    days = os.getenv("AUTO_JOIN_DAYS", "mon,tue,wed,thu,fri").lower().replace(" ", "")
+    if "-" in days:                       # "mon-fri"
+        a, b = days.split("-")
+        days = ",".join(_DAYS[_DAYS.index(a):_DAYS.index(b) + 1])
+    return {
+        "url": url,
+        "hour": int(hh), "minute": int(mm),
+        "days": [d for d in days.split(",") if d in _DAYS],
+        "max_minutes": float(os.getenv("AUTO_JOIN_MAX_MINUTES", "45")),
+        "late_minutes": float(os.getenv("AUTO_JOIN_LATE_MINUTES", "15")),
+    }
+
+async def _auto_join_loop() -> None:
+    import datetime
+    try:
+        cfg = _auto_join_config()
+    except Exception as e:
+        alog(f"AUTO-JOIN: off, bad settings in .env: {e}")
+        return
+    if not cfg:
+        alog("AUTO-JOIN: off (AUTO_JOIN_URL not set)")
+        return
+    alog(f"AUTO-JOIN: on, {','.join(cfg['days'])} at {cfg['hour']:02d}:{cfg['minute']:02d}, "
+         f"leaves after {cfg['max_minutes']:g} min")
+    while True:
+        try:
+            now = datetime.datetime.now()
+            due = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
+            today = now.date().isoformat()
+            # The date is stored, so a restart after joining doesn't join twice.
+            if (_DAYS[now.weekday()] in cfg["days"] and store.get_kv("auto_join_last_date") != today
+                    and due <= now <= due + datetime.timedelta(minutes=cfg["late_minutes"])):
+                store.set_kv("auto_join_last_date", today)
+                result = await _join_via_bot(cfg["url"], "Max", cfg["max_minutes"])
+                store.set_kv("auto_join_last_result", json.dumps({"at": store.now_label(), **result}))
+                alog(f"AUTO-JOIN: {result}")
+        except Exception as e:
+            alog(f"AUTO-JOIN error: {e}")
+        await asyncio.sleep(20)
+
+@app.on_event("startup")
+async def _start_auto_join() -> None:
+    asyncio.create_task(_auto_join_loop())
+
+
 # ── Task management endpoints ─────────────────────────────────────────────────
 
 @app.post("/tasks/log")
 async def post_task(request: Request):
-    task = await request.json()
-    task.setdefault("logged_at", time.strftime("%Y-%m-%d %H:%M IST"))
-    task.setdefault("status", "pending")
-    pending_tasks.append(task)
-    return {"ok": True, "task": task, "total_pending": len(pending_tasks)}
+    task = store.add_task(await request.json())
+    return {"ok": True, "task": task, "total_pending": len(store.list_tasks(status="pending"))}
 
 @app.get("/tasks/log")
-async def get_tasks():
+async def get_tasks(status: Optional[str] = None):
+    """All logged tasks, or only ?status=pending (what the morning test run reads)."""
     return {
-        "tasks":         pending_tasks,
-        "pending_count": len([t for t in pending_tasks if t.get("status") == "pending"]),
-        "as_of":         time.strftime("%Y-%m-%d %H:%M IST"),
+        "tasks":         store.list_tasks(status=status),
+        "pending_count": len(store.list_tasks(status="pending")),
+        "as_of":         store.now_label(),
     }
 
 @app.post("/tasks/result")
 async def post_result(request: Request):
-    result = await request.json()
-    result.setdefault("posted_at", time.strftime("%Y-%m-%d %H:%M IST"))
-    test_results.append(result)
-    for t in pending_tasks:
-        if t.get("ticket_id") == result.get("ticket_id"):
-            t["status"] = "done"
-            break
-    return {"ok": True, "result": result}
+    """The morning test run posts one result per ticket; the ticket's task is marked done."""
+    return {"ok": True, "result": store.add_result(await request.json())}
 
 @app.delete("/tasks/result/{ticket_id}")
 async def delete_result(ticket_id: str):
-    global test_results
-    before = len(test_results)
-    test_results = [r for r in test_results if r.get("ticket_id") != ticket_id]
-    removed = before - len(test_results)
+    removed = store.delete_results(ticket_id)
     if removed == 0:
         return {"ok": False, "detail": f"No result found for {ticket_id}"}
     return {"ok": True, "removed": removed, "ticket_id": ticket_id}
@@ -1054,42 +1179,43 @@ async def delete_result(ticket_id: str):
 @app.get("/tasks/results")
 async def get_results():
     return {
-        "results":  test_results,
-        "pending":  [t for t in pending_tasks if t.get("status") == "pending"],
-        "done":     [t for t in pending_tasks if t.get("status") == "done"],
-        "as_of":    time.strftime("%Y-%m-%d %H:%M IST"),
+        "results":  store.list_results(),
+        "pending":  store.list_tasks(status="pending"),
+        "done":     store.list_tasks(status="done"),
+        "as_of":    store.now_label(),
     }
 
 @app.post("/briefing")
 async def post_briefing(request: Request):
-    global briefing_cache
     body = await request.json()
-    briefing_cache = body.get("briefing", "")
+    store.set_briefing(body.get("briefing", ""))
     return {"ok": True}
 
 @app.get("/briefing")
 async def get_briefing():
-    return {"briefing": briefing_cache, "as_of": time.strftime("%Y-%m-%d %H:%M IST")}
+    return {"briefing": store.get_briefing(), "as_of": store.now_label()}
 
 
-# ── Standup notes endpoints ──────────────────────────────────────────────────
+# ── Standup notes endpoints (today's notes) ──────────────────────────────────
 
 @app.get("/notes")
 async def get_notes():
+    notes = store.list_notes()
     return {
-        "notes":      standup_notes,
-        "total":      len(standup_notes),
-        "as_of":      time.strftime("%Y-%m-%d %H:%M IST"),
+        "notes":      notes,
+        "total":      len(notes),
+        "as_of":      store.now_label(),
     }
 
 @app.delete("/notes")
 async def clear_notes():
-    standup_notes.clear()
+    store.clear_notes()
     return {"ok": True, "message": "Notes cleared"}
 
 @app.get("/notes/summary")
 async def get_notes_summary():
     """Get a formatted Slack-ready summary of standup notes."""
+    standup_notes = store.list_notes()
     if not standup_notes:
         return {"summary": "No notes captured this standup.", "notes": []}
     lines = [f"*Standup Notes — {time.strftime('%d %b %Y')}*\n"]
@@ -1105,6 +1231,7 @@ async def get_notes_summary():
 async def _post_meeting_notes_callback():
     """Called when Max exits a meeting — posts notes to the configured callback."""
     callback_url = os.getenv("NOTES_CALLBACK_URL", "")
+    standup_notes = store.list_notes()
     if not callback_url or not standup_notes:
         alog(f"NOTES CALLBACK: skipped (url={'set' if callback_url else 'unset'}, notes={len(standup_notes)})")
         return
@@ -1156,8 +1283,8 @@ async def debug():
         "diag_log":             diag_log[-50:],
         "pipecat_logs":         _pipecat_logs[-30:],
         "pipecat_version":      pc_version,
-        "pending_tasks":        len(pending_tasks),
-        "test_results":         len(test_results),
+        "pending_tasks":        len(store.list_tasks(status="pending")),
+        "test_results":         len(store.list_results()),
         "sample_rate":          SAMPLE_RATE,
         "as_of":                time.strftime("%Y-%m-%d %H:%M:%S IST"),
     }
@@ -1193,11 +1320,44 @@ async def debug_timings():
 
 @app.get("/health")
 async def health():
-    return {
-        "status":           "ok",
-        "architecture":     "pipecat-streaming",
+    """Self-hosted health (2026-10-23): max-brain is up, max-bot answers, keys are set.
+    503 when Max couldn't attend a meeting right now."""
+    from fastapi.responses import JSONResponse
+    bot_url = os.getenv("BOT_SERVICE_URL", "")
+    bot: dict = {"reachable": False}
+    if bot_url:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"{bot_url}/health", timeout=3)
+            bot = {"reachable": r.status_code == 200, "in_meeting": r.json().get("sessions")}
+        except Exception as e:
+            bot = {"reachable": False, "error": str(e)[:120]}
+    keys = {k: bool(os.getenv(k)) for k in ("GEMINI_API_KEY", "DEEPGRAM_API_KEY", "LINEAR_API_KEY")}
+    ok = bot["reachable"] and all(keys.values())
+    return JSONResponse(status_code=200 if ok else 503, content={
+        "status":           "ok" if ok else "degraded",
+        "max_bot":          bot,
+        "keys_set":         keys,
         "active_pipelines": len(active_pipelines),
-        "pending_tasks":    len([t for t in pending_tasks if t.get("status") == "pending"]),
-        "test_results":     len(test_results),
-        "briefing_ready":   bool(briefing_cache),
+        "pending_tasks":    len(store.list_tasks(status="pending")),
+        "test_results":     len(store.list_results()),
+        "briefing_ready":   bool(store.get_briefing()),
+        "auto_join":        _auto_join_summary(),
+    })
+
+
+def _auto_join_summary() -> dict:
+    try:
+        cfg = _auto_join_config()
+    except Exception as e:
+        return {"on": False, "error": f"bad settings: {e}"}
+    if not cfg:
+        return {"on": False}
+    last = store.get_kv("auto_join_last_result")
+    return {
+        "on":          True,
+        "when":        f"{','.join(cfg['days'])} {cfg['hour']:02d}:{cfg['minute']:02d} (Mac time)",
+        "meeting":     cfg["url"].rsplit("/", 1)[-1],
+        "max_minutes": cfg["max_minutes"],
+        "last":        json.loads(last) if last else None,
     }

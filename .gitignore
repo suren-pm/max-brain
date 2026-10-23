@@ -16,6 +16,9 @@ LivePortrait.zip
 max_test.wav
 max_face.jpg
 
+# Max's local database: tasks, test results, standup notes (2026-10-23)
+data/
+
 # Railway local link
 .railway/
 
